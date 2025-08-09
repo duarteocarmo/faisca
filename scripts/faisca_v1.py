@@ -1,6 +1,6 @@
 import os
 import urllib.request
-from types import SimpleNamespace
+from dataclasses import dataclass
 
 import matplotlib.pyplot as plt
 import torch
@@ -8,15 +8,39 @@ from torch import nn
 from torch.utils.data import DataLoader, Dataset
 
 
-def update_config(config, dictionary):
-    for k, v in dictionary.items():
-        setattr(config, k, v)
-    return config
+@dataclass
+class Config:
+    vocab_size: int
+    context_length: int
+    embedding_dimension: int
+    num_heads: int
+    num_layers: int
+    dropout_rate: float
+    qkv_bias: bool
+    num_epochs: int
+    learning_rate: float
+    weight_decay: float
+    device: str
+    eval_freq: int
+    eval_iter: int
+    batch_size: int
+    val_split: float
+    num_workers: int
+    drop_last: bool
+    max_length: int
+    stride: int
+    save_path: str
+    chart_path: str
 
-
-def show_config(config: SimpleNamespace):
-    for k in sorted(config.__dict__):
-        print(f"{k}: {getattr(config, k)}")
+    def __post_init__(self):
+        if self.device == "auto":
+            if torch.cuda.is_available():
+                self.device = "cuda"
+            elif torch.backends.mps.is_available():
+                self.device = "mps"
+            else:
+                self.device = "cpu"
+            print(f"Using device: {self.device}")
 
 
 class FaiscaDataset(Dataset):
@@ -141,45 +165,6 @@ class MultiHeadAttention(nn.Module):
         return context_vector
 
 
-class LayerNorm(nn.Module):
-    def __init__(self, embedding_dimension: int):
-        super().__init__()
-        self.eps = 1e-5  # small constant to avoid division by zero
-        self.scale = nn.Parameter(torch.ones(embedding_dimension))
-        self.shift = nn.Parameter(torch.zeros(embedding_dimension))
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        mean = x.mean(dim=-1, keepdim=True)
-        var = x.var(dim=-1, keepdim=True, unbiased=False)
-        norm_x = (x - mean) / torch.sqrt(var + self.eps)
-        return self.scale * norm_x + self.shift
-
-
-class GELU(nn.Module):
-    """
-    Gelu activation:
-    xi > 0 -> output ~ xi
-    -2 < xi < 2 -> output ~ 0
-    xi << -2 -> output ~ 0
-    """
-
-    def __init__(self):
-        super().__init__()
-
-    def forward(self, x):
-        return (
-            0.5
-            * x
-            * (
-                1
-                + torch.tanh(
-                    torch.sqrt(torch.tensor(2.0 / torch.pi))
-                    * (x + 0.044715 * torch.pow(x, 3))
-                )
-            )
-        )
-
-
 class FeedForward(nn.Module):
     def __init__(self, embedding_dimension: int, hidden_expansion_factor: int = 4):
         super().__init__()
@@ -187,7 +172,7 @@ class FeedForward(nn.Module):
             nn.Linear(
                 embedding_dimension, hidden_expansion_factor * embedding_dimension
             ),
-            GELU(),
+            nn.GELU(),
             nn.Linear(
                 hidden_expansion_factor * embedding_dimension, embedding_dimension
             ),
@@ -218,8 +203,8 @@ class TransformerBlock(nn.Module):
         self.feed_forward = FeedForward(
             embedding_dimension=embedding_dimension,
         )
-        self.norm1 = LayerNorm(embedding_dimension=embedding_dimension)
-        self.norm2 = LayerNorm(embedding_dimension=embedding_dimension)
+        self.norm1 = nn.LayerNorm(embedding_dimension)
+        self.norm2 = nn.LayerNorm(embedding_dimension)
         self.drop_shortcut = nn.Dropout(p=dropout_rate)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -269,7 +254,7 @@ class FaiscaGPT(nn.Module):
             ]
         )
 
-        self.final_layer_norm = LayerNorm(embedding_dimension=embedding_dimension)
+        self.final_layer_norm = nn.LayerNorm(embedding_dimension)
         self.out_head = nn.Linear(embedding_dimension, vocab_size, bias=False)
 
         n_params = sum(p.numel() for p in self.transformer_blocks.parameters())
@@ -281,7 +266,7 @@ class FaiscaGPT(nn.Module):
         print(f"Number of parameters in all layers: {n_params_all_million:.2f}M")
 
     def forward(self, in_idx: torch.Tensor) -> torch.Tensor:
-        batch_size, sequence_length = in_idx.shape
+        _, sequence_length = in_idx.shape
         token_embeddings = self.token_embedding(in_idx)
         positional_embeddings = self.positional_embedding(
             torch.arange(sequence_length, device=in_idx.device)
@@ -312,37 +297,28 @@ if __name__ == "__main__":
 
     tokenizer = tiktoken.get_encoding("gpt2")
 
-    config = SimpleNamespace()
-
-    config = update_config(
-        config,
-        {
-            "vocab_size": 50257,  # Vocabulary size
-            "context_length": context_length,  # Context length
-            "embedding_dimension": 768,  # Embedding dimension
-            "num_heads": 12,  # Number of attention heads
-            "num_layers": 12,  # Number of layers
-            "dropout_rate": 0.1,  # Dropout rate
-            "qkv_bias": False,  # QKV bias
-            "num_epochs": 10,
-            "learning_rate": 1e-3,
-            "weight_decay": 0.1,
-            "device": "cuda"
-            if torch.cuda.is_available()
-            else "mps"
-            if torch.backends.mps.is_available()
-            else "cpu",
-            "eval_freq": 5,
-            "eval_iter": 1,
-            "batch_size": 2,
-            "val_split": 0.1,
-            "num_workers": 0,
-            "drop_last": True,
-            "max_length": 256,
-            "stride": 128,
-            "save_path": "models/faisca_v1.pt",
-            "chart_path": "charts/faisca_v1.png",
-        },
+    config = Config(
+        vocab_size=50257,
+        context_length=context_length,
+        embedding_dimension=768,
+        num_heads=12,
+        num_layers=12,
+        dropout_rate=0.1,
+        qkv_bias=False,
+        num_epochs=1,
+        learning_rate=1e-3,
+        weight_decay=0.1,
+        device="auto",
+        eval_freq=5,
+        eval_iter=1,
+        batch_size=2,
+        val_split=0.1,
+        num_workers=0,
+        drop_last=True,
+        max_length=256,
+        stride=128,
+        save_path="models/faisca_v1.pt",
+        chart_path="charts/faisca_v1.png",
     )
 
     split_idx = int(len(bocage_text) * (1 - config.val_split))
