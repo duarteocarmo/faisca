@@ -1,0 +1,8 @@
+*.pth
+venv/
+*.pdf
+*.txt
+*.pt
+*.png
+
+.DS_Store
