@@ -4,5 +4,6 @@ venv/
 *.txt
 *.pt
 *.png
+*aider*
 
 .DS_Store

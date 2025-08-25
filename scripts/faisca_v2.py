@@ -87,11 +87,13 @@ class FeedForward(nn.Module):
         super().__init__()
         self.layers = nn.Sequential(
             nn.Linear(
-                embedding_dimension, hidden_expansion_factor * embedding_dimension
+                embedding_dimension,
+                hidden_expansion_factor * embedding_dimension,
             ),
             nn.GELU(),
             nn.Linear(
-                hidden_expansion_factor * embedding_dimension, embedding_dimension
+                hidden_expansion_factor * embedding_dimension,
+                embedding_dimension,
             ),
         )
 
@@ -334,7 +336,8 @@ def train(
                 idx_next = torch.argmax(logits, dim=-1, keepdim=True)
                 encoded = torch.cat((encoded, idx_next), dim=1)
 
-        print(f"\nGenerated: {encoded}")
+        encoded_pretty = encoded.squeeze(0).tolist()
+        print(f"\nGenerated: {encoded_pretty}")
         decoded = train_dataloader.dataset.decode(encoded[0])
         decoded = decoded.replace("\n", " ")
         print(f"Decoded: {decoded}\n")
@@ -357,7 +360,12 @@ def save_plots_and_model(
     epochs_tensor = torch.linspace(0, num_epochs, len(training_losses))
     # Plot training and validation loss against epochs
     ax1.plot(epochs_tensor, training_losses, label="Training loss")
-    ax1.plot(epochs_tensor, validation_losses, linestyle="-.", label="Validation loss")
+    ax1.plot(
+        epochs_tensor,
+        validation_losses,
+        linestyle="-.",
+        label="Validation loss",
+    )
     ax1.set_xlabel("Epochs")
     ax1.set_ylabel("Loss")
     ax1.legend(loc="upper right")
@@ -387,7 +395,7 @@ if __name__ == "__main__":
     bocage_text = Path(file_path).read_text()
     tokenizer = tiktoken.get_encoding("gpt2")
     current_time = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    torch.seed(42)
+    torch.manual_seed(42)
 
     config = Config(
         batch_size=2,
@@ -400,7 +408,7 @@ if __name__ == "__main__":
         eval_freq=5,
         eval_iter=1,
         eval_text="Quando pensares",
-        learning_rate=1e-3,
+        learning_rate=5e-4,
         max_length=256,
         num_epochs=10,
         num_heads=12,
