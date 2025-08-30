@@ -50,9 +50,7 @@ class Config:
 
 
 class FaiscaDataset(Dataset):
-    def __init__(
-        self, data: str, max_length: int, tokenizer: t.Any, stride: int
-    ):
+    def __init__(self, data: str, max_length: int, tokenizer: t.Any, stride: int):
         self.tokenizer = tokenizer
         chars = sorted(list(set(data)))
         self.vocab_size = len(chars)
@@ -72,9 +70,7 @@ class FaiscaDataset(Dataset):
         return len(self.input_ids)
 
     def __getitem__(self, idx):
-        return torch.tensor(self.input_ids[idx]), torch.tensor(
-            self.target_ids[idx]
-        )
+        return torch.tensor(self.input_ids[idx]), torch.tensor(self.target_ids[idx])
 
     def encode(self, text: str) -> torch.Tensor:
         encoded = self.tokenizer.encode(text)
@@ -87,9 +83,7 @@ class FaiscaDataset(Dataset):
 
 
 class FeedForward(nn.Module):
-    def __init__(
-        self, embedding_dimension: int, hidden_expansion_factor: int = 4
-    ):
+    def __init__(self, embedding_dimension: int, hidden_expansion_factor: int = 4):
         super().__init__()
         self.layers = nn.Sequential(
             nn.Linear(
@@ -136,13 +130,12 @@ class TransformerBlock(nn.Module):
         shortcut = x
         x = self.norm1(x)
 
-        T = x.size(1)
-        causal_mask = torch.triu(
-            torch.ones((T, T), device=x.device, dtype=torch.bool), diagonal=1
+        seq_len = x.size(1)
+        attn_mask = torch.triu(
+            torch.ones((seq_len, seq_len), device=x.device, dtype=torch.bool),
+            diagonal=1,
         )
-        x, _ = self.attention(
-            x, x, x, attn_mask=causal_mask
-        )  # PyTorch treats True as masked
+        x, _ = self.attention(x, x, x, is_causal=True, attn_mask=attn_mask)
         x = self.drop_shortcut(x)
         x = x + shortcut
 
@@ -169,9 +162,7 @@ class FaiscaGPT(nn.Module):
     ):
         super().__init__()
         self.token_embedding = nn.Embedding(vocab_size, embedding_dimension)
-        self.positional_embedding = nn.Embedding(
-            context_length, embedding_dimension
-        )
+        self.positional_embedding = nn.Embedding(context_length, embedding_dimension)
         self.dropout_embedding = nn.Dropout(p=dropout_rate)
 
         self.transformer_blocks = nn.Sequential(
@@ -233,9 +224,7 @@ def create_dataloaders(
     train_dataset_args = dataset_args.copy()
     train_dataset_args["data"] = train_data
 
-    train_dataloader = DataLoader(
-        FaiscaDataset(**train_dataset_args), **base_args
-    )
+    train_dataloader = DataLoader(FaiscaDataset(**train_dataset_args), **base_args)
 
     val_dataset_args = dataset_args.copy()
     val_dataset_args["data"] = val_data
@@ -309,9 +298,7 @@ def train(
                         ("validation", val_dataloader),
                     ]:
                         total_split_loss = 0
-                        for i, (input_batch, target_batch) in enumerate(
-                            dataloader
-                        ):
+                        for i, (input_batch, target_batch) in enumerate(dataloader):
                             if i < eval_iter:
                                 loss = calculate_loss(
                                     input_batch=input_batch,
