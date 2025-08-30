@@ -2,7 +2,6 @@ import os
 import typing as t
 from dataclasses import dataclass
 from datetime import datetime
-from pathlib import Path
 
 import matplotlib.pyplot as plt
 import tiktoken
@@ -10,29 +9,32 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
 
+import datasets as hf_datasets
+
 
 @dataclass
 class Config:
     batch_size: int
     chart_path: str
     context_length: int
+    dataloader_shuffle: bool
     device: str
     drop_last: bool
     dropout_rate: float
     embedding_dimension: int
+    eot_token: str
     eval_freq: int
     eval_iter: int
     eval_text: str
-    max_new_tokens: int
     learning_rate: float
     max_length: int
+    max_new_tokens: int
     num_epochs: int
     num_heads: int
     num_layers: int
     num_workers: int
     qkv_bias: bool
     save_path: str
-    dataloader_shuffle: bool
     stride: int
     val_split: float
     vocab_size: int
@@ -49,37 +51,62 @@ class Config:
             print(f"Using device: {self.device}")
 
 
-class FaiscaDataset(Dataset):
-    def __init__(self, data: str, max_length: int, tokenizer: t.Any, stride: int):
+class CCTitleDataset(Dataset):
+    def __init__(
+        self,
+        hf_split,
+        tokenizer: t.Any,
+        max_length: int,
+        stride: int,
+        language: str | None = None,
+        shuffle_titles: bool = True,
+        seed: int = 1337,
+    ):
         self.tokenizer = tokenizer
-        chars = sorted(list(set(data)))
-        self.vocab_size = len(chars)
+        self.max_length = max_length
+        self.stride = stride
+        self.seed = seed
+        self.vocab_size = tokenizer.n_vocab
+        self.EOT_TOKEN = "<|endoftext|>"
 
-        self.input_ids = []
-        self.target_ids = []
+        def process_row(row):
+            title = (row.get("title") or "").strip()
+            if language and row.get("language") != language:
+                return {"title": None}
+            return {"title": title if title else None}
 
-        token_ids = tokenizer.encode(data, allowed_special={"<|endoftext|>"})
+        hf_split = hf_split.map(process_row)
 
-        for i in range(0, len(token_ids) - max_length, stride):
-            input_ids = token_ids[i : i + max_length]
-            target_ids = token_ids[i + 1 : i + max_length + 1]
-            self.input_ids.append(input_ids)
-            self.target_ids.append(target_ids)
+        titles = [t for t in hf_split["title"] if t is not None]
 
-    def __len__(self):
-        return len(self.input_ids)
+        if shuffle_titles:
+            g = torch.Generator().manual_seed(seed)
+            perm = torch.randperm(len(titles), generator=g).tolist()
+            titles = [titles[i] for i in perm]
 
-    def __getitem__(self, idx):
-        return torch.tensor(self.input_ids[idx]), torch.tensor(self.target_ids[idx])
+        eot_id = tokenizer.encode(self.EOT_TOKEN, allowed_special={self.EOT_TOKEN})[0]
+        ids: list[int] = []
+        for doc in titles:
+            toks = tokenizer.encode(doc, allowed_special={self.EOT_TOKEN})
+            if toks:
+                ids.extend(toks)
+                ids.append(eot_id)
 
-    def encode(self, text: str) -> torch.Tensor:
-        encoded = self.tokenizer.encode(text)
-        encoded_tensor = torch.tensor(encoded).unsqueeze(0)
-        return encoded_tensor
+        self.inputs: list[list[int]] = []
+        self.targets: list[list[int]] = []
+        limit = max(0, len(ids) - max_length - 1)
+        for i in range(0, limit, stride):
+            x = ids[i : i + max_length]
+            y = ids[i + 1 : i + 1 + max_length]
+            if len(x) == max_length and len(y) == max_length:
+                self.inputs.append(x)
+                self.targets.append(y)
 
-    def decode(self, token_ids: torch.Tensor) -> str:
-        flat = token_ids.squeeze(0)
-        return self.tokenizer.decode(flat.tolist())
+    def __len__(self) -> int:
+        return len(self.inputs)
+
+    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
+        return torch.tensor(self.inputs[idx]), torch.tensor(self.targets[idx])
 
 
 class FeedForward(nn.Module):
@@ -129,12 +156,9 @@ class TransformerBlock(nn.Module):
         shortcut = x
         x = self.norm1(x)
 
-        seq_length = x.size(1)
-        attn_mask = torch.triu(
-            torch.ones(seq_length, seq_length, dtype=torch.bool, device=x.device),
-            1,
-        )
-        x, _ = self.attention(x, x, x, attn_mask=attn_mask)
+        L = x.size(1)
+        causal = torch.triu(torch.ones(L, L, dtype=torch.bool, device=x.device), 1)
+        x, _ = self.attention(x, x, x, attn_mask=causal)
         x = self.drop_shortcut(x)
         x = x + shortcut
 
@@ -198,39 +222,45 @@ class FaiscaGPT(nn.Module):
 
 
 def create_dataloaders(
-    train_data: str,
-    val_data: str,
+    train_split,
+    val_split,
     batch_size: int,
     shuffle: bool,
     drop_last: bool,
     num_workers: int,
     max_length: int,
     stride: int,
+    language: str | None = None,
+    seed: int = 1337,
 ) -> tuple[DataLoader, DataLoader]:
-    base_args = dict(
+    train_ds = CCTitleDataset(
+        hf_split=train_split,
+        tokenizer=tokenizer,
+        max_length=max_length,
+        stride=stride,
+        language=language,
+        shuffle_titles=True,
+        seed=seed,
+    )
+    val_ds = CCTitleDataset(
+        hf_split=val_split,
+        tokenizer=tokenizer,
+        max_length=max_length,
+        stride=stride,
+        language=language,
+        shuffle_titles=False,  # keep this deterministic
+        seed=seed,
+    )
+
+    common = dict(
         batch_size=batch_size,
-        shuffle=shuffle,
         drop_last=drop_last,
         num_workers=num_workers,
+        pin_memory=True,
     )
-
-    dataset_args = dict(
-        max_length=max_length,
-        tokenizer=tokenizer,
-        stride=stride,
-    )
-
-    train_dataset_args = dataset_args.copy()
-    train_dataset_args["data"] = train_data
-
-    train_dataloader = DataLoader(FaiscaDataset(**train_dataset_args), **base_args)
-
-    val_dataset_args = dataset_args.copy()
-    val_dataset_args["data"] = val_data
-
-    val_dataloader = DataLoader(FaiscaDataset(**val_dataset_args), **base_args)
-
-    return train_dataloader, val_dataloader
+    train_loader = DataLoader(train_ds, shuffle=shuffle, **common)
+    val_loader = DataLoader(val_ds, shuffle=False, **common)
+    return train_loader, val_loader
 
 
 def calculate_loss(input_batch, target_batch, model, device):
@@ -257,6 +287,9 @@ def train(
     max_new_tokens: int,
     train_dataloader: DataLoader,
     val_dataloader: DataLoader,
+    tokenizer: tiktoken.Encoding,
+    eot_token: str,
+    eval_text: str,
 ):
     training_losses, validation_losses, track_tokens_seen = [], [], []
     tokens_seen = 0
@@ -331,8 +364,15 @@ def train(
                     model.train()
 
         model.eval()
-        encoded = train_dataloader.dataset.encode(config.eval_text).to(device)
 
+        encoded = (
+            torch.tensor(
+                tokenizer.encode(eval_text, allowed_special={eot_token}),
+                dtype=torch.long,
+            )
+            .unsqueeze(0)
+            .to(device)
+        )
         with torch.no_grad():
             for _ in range(max_new_tokens):
                 idx_cond = encoded[:, -context_length:]
@@ -343,7 +383,7 @@ def train(
 
         encoded_pretty = encoded.squeeze(0).tolist()
         print(f"\nGenerated: {encoded_pretty}")
-        decoded = train_dataloader.dataset.decode(encoded[0])
+        decoded = tokenizer.decode(encoded[0].tolist())
         decoded = decoded.replace("\n", " ")
         print(f"Decoded: {decoded}\n")
 
@@ -359,6 +399,7 @@ def save_plots_and_model(
     training_losses: list[float],
     validation_losses: list[float],
     track_tokens_seen: list[float],
+    model: FaiscaGPT,
 ):
     fig, ax1 = plt.subplots()
 
@@ -396,9 +437,14 @@ def save_plots_and_model(
 
 
 if __name__ == "__main__":
-    file_path = "datasets/os-maias-mini.txt"
-    bocage_text = Path(file_path).read_text()
     tokenizer = tiktoken.get_encoding("gpt2")
+    ds = hf_datasets.load_dataset("duarteocarmo/ccnews-titles-2016")
+    ds_train, ds_val = ds["train"], ds["test"]
+    ds_train = ds_train.select(range(10_000))
+    ds_val = ds_val.select(range(100))
+
+    assert len(set(ds_train["title"]) & set(ds_val["title"])) == 0
+
     current_time = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     torch.manual_seed(42)
 
@@ -411,7 +457,7 @@ if __name__ == "__main__":
         dropout_rate=0.1,
         eval_freq=5,
         eval_iter=1,
-        eval_text="Quando pensares",
+        eval_text="Breaking news",
         learning_rate=5e-4,
         max_length=256,
         num_epochs=10,
@@ -420,23 +466,19 @@ if __name__ == "__main__":
         save_path=f"models/faisca_{current_time}.pt",
         stride=128,
         val_split=0.1,
-        vocab_size=50257,
+        vocab_size=tokenizer.n_vocab,
         weight_decay=0.1,
         dataloader_shuffle=True,
         max_new_tokens=250,
-        # GPT configurations
         embedding_dimension=768,
         num_heads=12,
         num_layers=12,
+        eot_token="<|endoftext|>",
     )
 
-    split_idx = int(len(bocage_text) * (1 - config.val_split))
-    train_data = bocage_text[:split_idx]
-    val_data = bocage_text[split_idx:]
-
     train_dataloader, val_dataloader = create_dataloaders(
-        train_data=train_data,
-        val_data=val_data,
+        train_split=ds_train,
+        val_split=ds_val,
         batch_size=config.batch_size,
         drop_last=config.drop_last,
         shuffle=config.dataloader_shuffle,
@@ -467,6 +509,9 @@ if __name__ == "__main__":
         max_new_tokens=config.max_new_tokens,
         train_dataloader=train_dataloader,
         val_dataloader=val_dataloader,
+        tokenizer=tokenizer,
+        eot_token=config.eot_token,
+        eval_text=config.eval_text,
     )
 
     save_plots_and_model(
@@ -476,4 +521,5 @@ if __name__ == "__main__":
         validation_losses=validation_losses,
         training_losses=training_losses,
         track_tokens_seen=track_tokens_seen,
+        model=model,
     )
