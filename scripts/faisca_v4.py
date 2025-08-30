@@ -126,16 +126,15 @@ class TransformerBlock(nn.Module):
         self.drop_shortcut = nn.Dropout(p=dropout_rate)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # shortcut connection // attention
         shortcut = x
         x = self.norm1(x)
 
-        seq_len = x.size(1)
+        seq_length = x.size(1)
         attn_mask = torch.triu(
-            torch.ones((seq_len, seq_len), device=x.device, dtype=torch.bool),
-            diagonal=1,
+            torch.ones(seq_length, seq_length, dtype=torch.bool, device=x.device),
+            1,
         )
-        x, _ = self.attention(x, x, x, is_causal=True, attn_mask=attn_mask)
+        x, _ = self.attention(x, x, x, attn_mask=attn_mask)
         x = self.drop_shortcut(x)
         x = x + shortcut
 
