@@ -326,9 +326,11 @@ def generate_samples(
 
             decoded = tokenizer.decode(encoded_completion[0].tolist())
             decoded = decoded.replace("\n", " ").strip()
+            instances = decoded.split(eot_token)  # split at eot token
 
             print(f"**** GENERATION {gen_num + 1} OF {num_samples} ****")
-            print(decoded)
+            for instance in instances:
+                print(f"> '{instance}'")
             print("*" * 25)
 
 
@@ -528,9 +530,9 @@ if __name__ == "__main__":
         device="auto",
         drop_last=True,
         dropout_rate=0.1,
-        eval_freq=5,
+        eval_freq=20,
         eval_iter=5,
-        eval_text="Breaking:",
+        eval_text="Presidente",
         learning_rate=3e-4,
         max_length=256,
         max_test_size=5000,
@@ -549,10 +551,10 @@ if __name__ == "__main__":
         num_heads=4,
         num_layers=4,
         eot_token="<|endoftext|>",
-        eval_num_samples=5,
+        eval_num_samples=3,
         eval_temperature=1.0,
         eval_top_k=30,
-        eval_max_new_tokens=30,
+        eval_max_new_tokens=60,
     )
 
     train_dataloader, val_dataloader = create_dataloaders(
