@@ -25,10 +25,17 @@ class Config:
     eot_token: str
     eval_freq: int
     eval_iter: int
+    eval_num_samples: int
+    eval_temperature: float
+    eval_max_new_tokens: int
     eval_text: str
+    eval_top_k: int
     learning_rate: float
     max_length: int
+    train_language: str
     max_new_tokens: int
+    max_test_size: int
+    max_train_size: int
     num_epochs: int
     num_heads: int
     num_layers: int
@@ -36,7 +43,6 @@ class Config:
     qkv_bias: bool
     save_path: str
     stride: int
-    val_split: float
     vocab_size: int
     weight_decay: float
 
@@ -61,6 +67,7 @@ class CCTitleDataset(Dataset):
         language: str | None = None,
         shuffle_titles: bool = True,
         seed: int = 1337,
+        max_size: int | None = None,
     ):
         self.tokenizer = tokenizer
         self.max_length = max_length
@@ -78,6 +85,10 @@ class CCTitleDataset(Dataset):
         hf_split = hf_split.map(process_row)
 
         titles = [t for t in hf_split["title"] if t is not None]
+
+        # Apply size limit if specified
+        if max_size is not None and len(titles) > max_size:
+            titles = titles[:max_size]
 
         if shuffle_titles:
             g = torch.Generator().manual_seed(seed)
@@ -232,6 +243,8 @@ def create_dataloaders(
     stride: int,
     language: str | None = None,
     seed: int = 1337,
+    max_train_size: int | None = None,
+    max_test_size: int | None = None,
 ) -> tuple[DataLoader, DataLoader]:
     train_ds = CCTitleDataset(
         hf_split=train_split,
@@ -241,6 +254,7 @@ def create_dataloaders(
         language=language,
         shuffle_titles=True,
         seed=seed,
+        max_size=max_train_size,
     )
     val_ds = CCTitleDataset(
         hf_split=val_split,
@@ -250,6 +264,7 @@ def create_dataloaders(
         language=language,
         shuffle_titles=False,  # keep this deterministic
         seed=seed,
+        max_size=max_test_size,
     )
 
     common = dict(
@@ -275,6 +290,76 @@ def calculate_loss(input_batch, target_batch, model, device):
     return loss
 
 
+def generate_samples(
+    model: FaiscaGPT,
+    tokenizer: tiktoken.Encoding,
+    max_new_tokens: int,
+    num_samples: int,
+    prompt: str,
+    temperature: float,
+    top_k: int,
+    device: str,
+    eot_token: str,
+    context_length: int,
+) -> None:
+    model.eval()
+
+    with torch.no_grad():
+        encoded = (
+            torch.tensor(
+                tokenizer.encode(prompt, allowed_special={eot_token}),
+                dtype=torch.long,
+            )
+            .unsqueeze(0)
+            .to(device)
+        )
+
+        for gen_num in range(num_samples):
+            encoded_completion = generate_single_sample(
+                model=model,
+                encoded=encoded,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                top_k=top_k,
+                context_length=context_length,
+            )
+
+            decoded = tokenizer.decode(encoded_completion[0].tolist())
+            decoded = decoded.replace("\n", " ").strip()
+
+            print(f"**** GENERATION {gen_num + 1} OF {num_samples} ****")
+            print(decoded)
+            print("*" * 25)
+
+
+def generate_single_sample(
+    model: FaiscaGPT,
+    encoded: torch.Tensor,
+    max_new_tokens: int,
+    temperature: float,
+    context_length: int,
+    top_k: int,
+    stop_at_eot: int | None = None,
+) -> torch.Tensor:
+    for _ in range(max_new_tokens):
+        idx_cond = encoded[:, -context_length:]
+
+        logits = model(idx_cond)
+        logits = logits[:, -1, :] / temperature
+
+        v, _ = torch.topk(logits, top_k)
+        logits[logits < v[:, [-1]]] = -float("Inf")
+
+        probs = torch.nn.functional.softmax(logits, dim=-1)
+        idx_next = torch.multinomial(probs, num_samples=1)
+
+        encoded = torch.cat((encoded, idx_next), dim=1)
+        if stop_at_eot is not None and idx_next.item() == stop_at_eot:
+            break
+
+    return encoded
+
+
 def train(
     model: FaiscaGPT,
     learning_rate: float,
@@ -284,12 +369,15 @@ def train(
     device: str,
     eval_freq: int,
     eval_iter: int,
-    max_new_tokens: int,
     train_dataloader: DataLoader,
     val_dataloader: DataLoader,
     tokenizer: tiktoken.Encoding,
     eot_token: str,
     eval_text: str,
+    eval_num_samples: int,
+    eval_temperature: float,
+    eval_top_k: int,
+    eval_max_new_tokens: int,
 ):
     training_losses, validation_losses, track_tokens_seen = [], [], []
     tokens_seen = 0
@@ -363,29 +451,18 @@ def train(
 
                     model.train()
 
-        model.eval()
-
-        encoded = (
-            torch.tensor(
-                tokenizer.encode(eval_text, allowed_special={eot_token}),
-                dtype=torch.long,
-            )
-            .unsqueeze(0)
-            .to(device)
+        generate_samples(
+            model=model,
+            tokenizer=tokenizer,
+            max_new_tokens=eval_max_new_tokens,
+            num_samples=eval_num_samples,
+            prompt=eval_text,
+            temperature=eval_temperature,
+            top_k=eval_top_k,
+            device=device,
+            eot_token=eot_token,
+            context_length=context_length,
         )
-        with torch.no_grad():
-            for _ in range(max_new_tokens):
-                idx_cond = encoded[:, -context_length:]
-                logits = model(idx_cond)
-                logits = logits[:, -1, :]
-                idx_next = torch.argmax(logits, dim=-1, keepdim=True)
-                encoded = torch.cat((encoded, idx_next), dim=1)
-
-        encoded_pretty = encoded.squeeze(0).tolist()
-        print(f"\nGenerated: {encoded_pretty}")
-        decoded = tokenizer.decode(encoded[0].tolist())
-        decoded = decoded.replace("\n", " ")
-        print(f"Decoded: {decoded}\n")
 
         model.train()
 
@@ -440,51 +517,56 @@ if __name__ == "__main__":
     tokenizer = tiktoken.get_encoding("gpt2")
     ds = hf_datasets.load_dataset("duarteocarmo/ccnews-titles-2016")
     ds_train, ds_val = ds["train"], ds["test"]
-    ds_train = ds_train.select(range(10_000))
-    ds_val = ds_val.select(range(100))
-
-    assert len(set(ds_train["title"]) & set(ds_val["title"])) == 0
 
     current_time = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     torch.manual_seed(42)
 
     config = Config(
-        batch_size=2,
+        batch_size=64,
         chart_path=f"charts/faisca_{current_time}.png",
-        context_length=256,
+        context_length=128,
         device="auto",
         drop_last=True,
         dropout_rate=0.1,
         eval_freq=5,
-        eval_iter=1,
-        eval_text="Breaking news",
-        learning_rate=5e-4,
+        eval_iter=5,
+        eval_text="Breaking:",
+        learning_rate=3e-4,
         max_length=256,
-        num_epochs=10,
+        max_test_size=5000,
+        max_train_size=25000,
+        train_language="pt",
+        num_epochs=15,
         num_workers=0,
         qkv_bias=False,
         save_path=f"models/faisca_{current_time}.pt",
-        stride=128,
-        val_split=0.1,
+        stride=64,
         vocab_size=tokenizer.n_vocab,
         weight_decay=0.1,
         dataloader_shuffle=True,
         max_new_tokens=250,
-        embedding_dimension=768,
-        num_heads=12,
-        num_layers=12,
+        embedding_dimension=128,
+        num_heads=4,
+        num_layers=4,
         eot_token="<|endoftext|>",
+        eval_num_samples=5,
+        eval_temperature=1.0,
+        eval_top_k=30,
+        eval_max_new_tokens=30,
     )
 
     train_dataloader, val_dataloader = create_dataloaders(
         train_split=ds_train,
         val_split=ds_val,
+        language=config.train_language,
         batch_size=config.batch_size,
         drop_last=config.drop_last,
         shuffle=config.dataloader_shuffle,
         num_workers=config.num_workers,
         max_length=config.max_length,
         stride=config.stride,
+        max_train_size=config.max_train_size,
+        max_test_size=config.max_test_size,
     )
 
     model = FaiscaGPT(
@@ -506,12 +588,15 @@ if __name__ == "__main__":
         device=config.device,
         eval_freq=config.eval_freq,
         eval_iter=config.eval_iter,
-        max_new_tokens=config.max_new_tokens,
         train_dataloader=train_dataloader,
         val_dataloader=val_dataloader,
         tokenizer=tokenizer,
         eot_token=config.eot_token,
+        eval_max_new_tokens=config.eval_max_new_tokens,
         eval_text=config.eval_text,
+        eval_num_samples=config.eval_num_samples,
+        eval_temperature=config.eval_temperature,
+        eval_top_k=config.eval_top_k,
     )
 
     save_plots_and_model(
