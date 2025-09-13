@@ -7,3 +7,4 @@ venv/
 *aider*
 
 .DS_Store
+scripts/__pycache__
