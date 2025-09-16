@@ -1,5 +1,6 @@
 import os
 import typing as t
+from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -190,33 +191,33 @@ class TransformerBlock(nn.Module):
 class FaiscaGPT(nn.Module):
     def __init__(
         self,
-        vocab_size: int,
-        embedding_dimension: int,
-        context_length: int,
-        num_layers: int,
-        num_heads: int,
-        dropout_rate: float,
-        qkv_bias: bool,
+        config: Config,
     ):
         super().__init__()
-        self.token_embedding = nn.Embedding(vocab_size, embedding_dimension)
-        self.positional_embedding = nn.Embedding(context_length, embedding_dimension)
-        self.dropout_embedding = nn.Dropout(p=dropout_rate)
+        self.token_embedding = nn.Embedding(
+            config.vocab_size, config.embedding_dimension
+        )
+        self.positional_embedding = nn.Embedding(
+            config.context_length, config.embedding_dimension
+        )
+        self.dropout_embedding = nn.Dropout(p=config.dropout_rate)
 
         self.transformer_blocks = nn.Sequential(
             *[
                 TransformerBlock(
-                    embedding_dimension=embedding_dimension,
-                    num_heads=num_heads,
-                    qkv_bias=qkv_bias,
-                    dropout_rate=dropout_rate,
+                    embedding_dimension=config.embedding_dimension,
+                    num_heads=config.num_heads,
+                    qkv_bias=config.qkv_bias,
+                    dropout_rate=config.dropout_rate,
                 )
-                for _ in range(num_layers)
+                for _ in range(config.num_layers)
             ]
         )
 
-        self.final_layer_norm = nn.LayerNorm(embedding_dimension)
-        self.out_head = nn.Linear(embedding_dimension, vocab_size, bias=False)
+        self.final_layer_norm = nn.LayerNorm(config.embedding_dimension)
+        self.out_head = nn.Linear(
+            config.embedding_dimension, config.vocab_size, bias=False
+        )
 
         n_params_all = sum(p.numel() for p in self.parameters())
         n_params_all_million = n_params_all / 1e6
@@ -239,48 +240,39 @@ class FaiscaGPT(nn.Module):
 def create_dataloaders(
     train_split,
     val_split,
-    batch_size: int,
-    shuffle: bool,
-    drop_last: bool,
-    num_workers: int,
-    max_length: int,
-    stride: int,
-    language: str | None = None,
-    url_filter: str | None = None,
+    config: Config,
     seed: int = 1337,
-    max_train_size: int | None = None,
-    max_test_size: int | None = None,
 ) -> tuple[DataLoader, DataLoader]:
     train_ds = CCTitleDataset(
         hf_split=train_split,
         tokenizer=tokenizer,
-        max_length=max_length,
-        stride=stride,
-        language=language,
-        url_filter=url_filter,
+        max_length=config.max_length,
+        stride=config.stride,
+        language=config.train_language,
+        url_filter=config.url_filter,
         shuffle_titles=True,
         seed=seed,
-        max_size=max_train_size,
+        max_size=config.max_train_size,
     )
     val_ds = CCTitleDataset(
         hf_split=val_split,
         tokenizer=tokenizer,
-        max_length=max_length,
-        stride=stride,
-        language=language,
-        url_filter=url_filter,
+        max_length=config.max_length,
+        stride=config.stride,
+        language=config.train_language,
+        url_filter=config.url_filter,
         shuffle_titles=False,  # keep this deterministic
         seed=seed,
-        max_size=max_test_size,
+        max_size=config.max_test_size,
     )
 
     common = dict(
-        batch_size=batch_size,
-        drop_last=drop_last,
-        num_workers=num_workers,
+        batch_size=config.batch_size,
+        drop_last=config.drop_last,
+        num_workers=config.num_workers,
         pin_memory=True,
     )
-    train_loader = DataLoader(train_ds, shuffle=shuffle, **common)
+    train_loader = DataLoader(train_ds, shuffle=config.dataloader_shuffle, **common)
     val_loader = DataLoader(val_ds, shuffle=False, **common)
     return train_loader, val_loader
 
@@ -300,42 +292,35 @@ def calculate_loss(input_batch, target_batch, model, device):
 def generate_samples(
     model: FaiscaGPT,
     tokenizer: tiktoken.Encoding,
-    max_new_tokens: int,
-    num_samples: int,
-    prompt: str,
-    temperature: float,
-    top_k: int,
-    device: str,
-    eot_token: str,
-    context_length: int,
+    config: Config,
 ) -> None:
     model.eval()
 
     with torch.no_grad():
         encoded = (
             torch.tensor(
-                tokenizer.encode(prompt, allowed_special={eot_token}),
+                tokenizer.encode(config.eval_text, allowed_special={config.eot_token}),
                 dtype=torch.long,
             )
             .unsqueeze(0)
-            .to(device)
+            .to(config.device)
         )
 
-        for gen_num in range(num_samples):
+        for gen_num in range(config.eval_num_samples):
             encoded_completion = generate_single_sample(
                 model=model,
                 encoded=encoded,
-                max_new_tokens=max_new_tokens,
-                temperature=temperature,
-                top_k=top_k,
-                context_length=context_length,
+                max_new_tokens=config.eval_max_new_tokens,
+                temperature=config.eval_temperature,
+                top_k=config.eval_top_k,
+                context_length=config.context_length,
             )
 
             decoded = tokenizer.decode(encoded_completion[0].tolist())
             decoded = decoded.replace("\n", " ").strip()
-            instances = decoded.split(eot_token)  # split at eot token
+            instances = decoded.split(config.eot_token)  # split at eot token
 
-            print(f"**** GENERATION {gen_num + 1} OF {num_samples} ****")
+            print(f"**** GENERATION {gen_num + 1} OF {config.eval_num_samples} ****")
             for instance in instances:
                 print(f"> '{instance}'")
             print("*" * 25)
@@ -371,34 +356,24 @@ def generate_single_sample(
 
 def train(
     model: FaiscaGPT,
-    learning_rate: float,
-    weight_decay: float,
-    num_epochs: int,
-    context_length: int,
-    device: str,
-    eval_freq: int,
-    eval_iter: int,
+    config: Config,
     train_dataloader: DataLoader,
     val_dataloader: DataLoader,
     tokenizer: tiktoken.Encoding,
-    eot_token: str,
-    eval_text: str,
-    eval_num_samples: int,
-    eval_temperature: float,
-    eval_top_k: int,
-    eval_max_new_tokens: int,
 ):
     training_losses, validation_losses, track_tokens_seen = [], [], []
     tokens_seen = 0
     global_step = -1
 
     optimizer = torch.optim.AdamW(
-        model.parameters(), lr=learning_rate, weight_decay=weight_decay
+        model.parameters(),
+        lr=config.learning_rate,
+        weight_decay=config.weight_decay,
     )
 
-    model.to(device)
+    model.to(config.device)
 
-    for epoch in range(num_epochs):
+    for epoch in range(config.num_epochs):
         model.train()
         size_train_dataloader = len(train_dataloader)
         batch_num = 0
@@ -409,7 +384,7 @@ def train(
                 input_batch=input_batch,
                 target_batch=target_batch,
                 model=model,
-                device=device,
+                device=config.device,
             )
             loss.backward()
             optimizer.step()
@@ -418,7 +393,7 @@ def train(
             batch_num += 1
 
             # run evaluation
-            if global_step % eval_freq == 0:
+            if global_step % config.eval_freq == 0:
                 model.eval()
                 with torch.no_grad():
                     losses = dict()
@@ -428,18 +403,18 @@ def train(
                     ]:
                         total_split_loss = 0
                         for i, (input_batch, target_batch) in enumerate(dataloader):
-                            if i < eval_iter:
+                            if i < config.eval_iter:
                                 loss = calculate_loss(
                                     input_batch=input_batch,
                                     target_batch=target_batch,
                                     model=model,
-                                    device=device,
+                                    device=config.device,
                                 )
                                 total_split_loss += loss.item()
                             else:
                                 break
 
-                        losses[split] = total_split_loss / eval_iter
+                        losses[split] = total_split_loss / config.eval_iter
 
                     train_loss = losses["train"]
                     validation_loss = losses["validation"]
@@ -463,14 +438,7 @@ def train(
         generate_samples(
             model=model,
             tokenizer=tokenizer,
-            max_new_tokens=eval_max_new_tokens,
-            num_samples=eval_num_samples,
-            prompt=eval_text,
-            temperature=eval_temperature,
-            top_k=eval_top_k,
-            device=device,
-            eot_token=eot_token,
-            context_length=context_length,
+            config=config,
         )
 
         model.train()
@@ -479,9 +447,7 @@ def train(
 
 
 def save_plots_and_model(
-    num_epochs: int,
-    chart_path: str,
-    save_path: str,
+    config: Config,
     training_losses: list[float],
     validation_losses: list[float],
     track_tokens_seen: list[float],
@@ -489,7 +455,7 @@ def save_plots_and_model(
 ):
     fig, ax1 = plt.subplots()
 
-    epochs_tensor = torch.linspace(0, num_epochs, len(training_losses))
+    epochs_tensor = torch.linspace(0, config.num_epochs, len(training_losses))
     # Plot training and validation loss against epochs
     ax1.plot(epochs_tensor, training_losses, label="Training loss")
     ax1.plot(
@@ -511,15 +477,15 @@ def save_plots_and_model(
 
     fig.tight_layout()  # Adjust layout to make room
 
-    if not os.path.exists(os.path.dirname(chart_path)):
-        os.makedirs(os.path.dirname(chart_path))
-    fig.savefig(chart_path)
-    print(f"Chart saved to {chart_path}")
+    if not os.path.exists(os.path.dirname(config.chart_path)):
+        os.makedirs(os.path.dirname(config.chart_path))
+    fig.savefig(config.chart_path)
+    print(f"Chart saved to {config.chart_path}")
 
-    if not os.path.exists(os.path.dirname(save_path)):
-        os.makedirs(os.path.dirname(save_path))
-    torch.save(model.state_dict(), save_path)
-    print(f"Model saved to {save_path}")
+    if not os.path.exists(os.path.dirname(config.save_path)):
+        os.makedirs(os.path.dirname(config.save_path))
+    torch.save(model.state_dict(), config.save_path)
+    print(f"Model saved to {config.save_path}")
 
 
 if __name__ == "__main__":
@@ -547,7 +513,7 @@ if __name__ == "__main__":
         train_language="pt",
         url_filter=None,
         # num_epochs=15,
-        num_epochs=4,
+        num_epochs=7,
         num_workers=0,
         qkv_bias=False,
         save_path=f"models/faisca_{current_time}.pt",
@@ -567,13 +533,7 @@ if __name__ == "__main__":
     )
 
     model = FaiscaGPT(
-        vocab_size=config.vocab_size,
-        embedding_dimension=config.embedding_dimension,
-        context_length=config.context_length,
-        num_layers=config.num_layers,
-        num_heads=config.num_heads,
-        dropout_rate=config.dropout_rate,
-        qkv_bias=config.qkv_bias,
+        config=config,
     )
 
     print("\n========== PRE-TRAINING ==========")
@@ -581,45 +541,75 @@ if __name__ == "__main__":
     train_dataloader, val_dataloader = create_dataloaders(
         train_split=ds_train,
         val_split=ds_val,
-        language=config.train_language,
-        batch_size=config.batch_size,
-        drop_last=config.drop_last,
-        shuffle=config.dataloader_shuffle,
-        num_workers=config.num_workers,
-        max_length=config.max_length,
-        stride=config.stride,
-        max_train_size=config.max_train_size,
-        max_test_size=config.max_test_size,
+        config=config,
     )
 
     model, training_losses, validation_losses, track_tokens_seen = train(
         model=model,
-        learning_rate=config.learning_rate,
-        weight_decay=config.weight_decay,
-        num_epochs=config.num_epochs,
-        context_length=config.context_length,
-        device=config.device,
-        eval_freq=config.eval_freq,
-        eval_iter=config.eval_iter,
+        config=config,
         train_dataloader=train_dataloader,
         val_dataloader=val_dataloader,
         tokenizer=tokenizer,
-        eot_token=config.eot_token,
-        eval_max_new_tokens=config.eval_max_new_tokens,
-        eval_text=config.eval_text,
-        eval_num_samples=config.eval_num_samples,
-        eval_temperature=config.eval_temperature,
-        eval_top_k=config.eval_top_k,
     )
 
     save_plots_and_model(
-        num_epochs=config.num_epochs,
-        chart_path=config.chart_path,
-        save_path=config.save_path,
+        config=config,
         validation_losses=validation_losses,
         training_losses=training_losses,
         track_tokens_seen=track_tokens_seen,
         model=model,
     )
 
+    print("\n========== PRE-TRAINING COMPLETED ==========")
+
+    generate_samples(
+        model=model,
+        tokenizer=tokenizer,
+        config=config,
+    )
+
     print("\n========== SUPERVISED FINE-TUNING ==========")
+
+    sft_config = deepcopy(config)
+    sft_config.url_filter = ".pt/"
+    sft_config.save_path = f"models/faisca_{current_time}_sft.pt"
+    sft_config.num_epochs = 4
+    sft_config.chart_path = f"charts/faisca_{current_time}_sft.png"
+    sft_config.max_train_size = 5000
+    sft_config.max_test_size = 1000
+    sft_config.eval_freq = 5
+
+    sft_train_dataloader, sft_val_dataloader = create_dataloaders(
+        train_split=ds_train,
+        val_split=ds_val,
+        config=sft_config,
+    )
+
+    (
+        sft_model,
+        sft_training_losses,
+        sft_validation_losses,
+        sft_track_tokens_seen,
+    ) = train(
+        model=model,
+        config=sft_config,
+        train_dataloader=sft_train_dataloader,
+        val_dataloader=sft_val_dataloader,
+        tokenizer=tokenizer,
+    )
+
+    save_plots_and_model(
+        config=sft_config,
+        validation_losses=sft_validation_losses,
+        training_losses=sft_training_losses,
+        track_tokens_seen=sft_track_tokens_seen,
+        model=sft_model,
+    )
+
+    print("\n========== SUPERVISED FINE-TUNING COMPLETED ==========")
+
+    generate_samples(
+        model=sft_model,
+        tokenizer=tokenizer,
+        config=sft_config,
+    )

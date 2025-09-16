@@ -564,6 +564,8 @@ if __name__ == "__main__":
         qkv_bias=config.qkv_bias,
     )
 
+    # PRE-TRAINING
+
     model, training_losses, validation_losses, track_tokens_seen = train(
         model=model,
         learning_rate=config.learning_rate,
@@ -593,3 +595,5 @@ if __name__ == "__main__":
         track_tokens_seen=track_tokens_seen,
         model=model,
     )
+
+    # SUPERVISED FINE-TUNING
