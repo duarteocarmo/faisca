@@ -508,12 +508,11 @@ if __name__ == "__main__":
         eval_text="Presidente",
         learning_rate=3e-4,
         max_length=256,
-        max_test_size=5000,
-        max_train_size=25000,
+        max_test_size=6000,
+        max_train_size=30_000,
         train_language="pt",
         url_filter=None,
-        # num_epochs=15,
-        num_epochs=7,
+        num_epochs=10,
         num_workers=0,
         qkv_bias=False,
         save_path=f"models/faisca_{current_time}.pt",
@@ -526,8 +525,8 @@ if __name__ == "__main__":
         num_heads=4,
         num_layers=4,
         eot_token="<|endoftext|>",
-        eval_num_samples=3,
-        eval_temperature=1.0,
+        eval_num_samples=2,
+        eval_temperature=0.5,
         eval_top_k=30,
         eval_max_new_tokens=60,
     )
@@ -573,10 +572,10 @@ if __name__ == "__main__":
     sft_config = deepcopy(config)
     sft_config.url_filter = ".pt/"
     sft_config.save_path = f"models/faisca_{current_time}_sft.pt"
-    sft_config.num_epochs = 4
+    sft_config.num_epochs = 3
     sft_config.chart_path = f"charts/faisca_{current_time}_sft.png"
-    sft_config.max_train_size = 5000
-    sft_config.max_test_size = 1000
+    sft_config.max_train_size = 10_000
+    sft_config.max_test_size = 2_000
     sft_config.eval_freq = 5
 
     sft_train_dataloader, sft_val_dataloader = create_dataloaders(
