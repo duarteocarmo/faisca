@@ -265,6 +265,8 @@ def rollout(
         return_attention_mask=True,
     ).to("mps")
 
+    print(model_inputs["attention_mask"])
+
     # duplicate prompt num_rollouts times
     model_inputs["attention_mask"] = model_inputs["attention_mask"].repeat(
         num_rollouts, 1
@@ -282,9 +284,7 @@ def rollout(
         max_length=max_length,
         pad_token_id=pad_token_id,
     )
-    sequence_ids = model.generate(
-        **model_inputs, generation_config=generation_config
-    )
+    sequence_ids = model.generate(**model_inputs, generation_config=generation_config)
     completions = tokenizer.batch_decode(
         sequence_ids[:, input_ids.shape[1] :], skip_special_tokens=True
     )
@@ -293,6 +293,8 @@ def rollout(
     action_mask[:, input_ids.shape[1] :] = True
     action_mask[sequence_ids == pad_token_id] = False
     action_mask = action_mask[:, 1:]
+
+    breakpoint()
 
     # Calculate rewards based on sentiment
     returns = torch.zeros(num_rollouts, 1, dtype=torch.float)
@@ -384,9 +386,7 @@ def main():
     top_p = 1.0
     temperature = 1.0
 
-    device = torch.device(
-        "mps" if torch.backends.mps.is_available() else "cpu"
-    )
+    device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
     cpu_device = torch.device("cpu")
     init_rng(seed)
 
@@ -506,12 +506,8 @@ def main():
                     continue
 
                 loss.backward()
-                grad_norm = clip_grad_norm_(
-                    model.parameters(), max_norm=max_norm
-                )
-                print(
-                    f"{step_epoch}: kl={kl: .4f}, grad_norm={grad_norm: .4f}"
-                )
+                grad_norm = clip_grad_norm_(model.parameters(), max_norm=max_norm)
+                print(f"{step_epoch}: kl={kl: .4f}, grad_norm={grad_norm: .4f}")
 
                 optimizer.step()
                 step_kl_values.append(kl.item())

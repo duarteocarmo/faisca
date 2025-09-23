@@ -1,6 +1,5 @@
 import os
 import typing as t
-from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -488,6 +487,90 @@ def save_plots_and_model(
     print(f"Model saved to {config.save_path}")
 
 
+def calculate_reward_for(text: str) -> float:
+    return 1.0 if "!" in text else 0.0
+
+
+def rollout(
+    prompt: str,
+    model: FaiscaGPT,
+    tokenizer: tiktoken.Encoding,
+    config: Config,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[str]]:
+    # Get token IDs
+    eot_token_id = tokenizer.encode(
+        config["eot_token"], allowed_special={config["eot_token"]}
+    )[0]
+
+    # Encode prompt and create tensors
+    input_ids = tokenizer.encode(prompt, allowed_special={config["eot_token"]})
+    input_ids = torch.tensor([input_ids], dtype=torch.long)
+    attention_mask = torch.ones_like(input_ids)
+
+    # Repeat for multiple rollouts
+    attention_mask = attention_mask.repeat(config["num_rollouts"], 1)
+    input_ids = input_ids.repeat(config["num_rollouts"], 1)
+
+    # Generate sequences
+    sequence_ids = generate_single_sample(
+        model=model,
+        encoded=input_ids,
+        max_new_tokens=config["max_new_tokens"],
+        temperature=config["temperature"],
+        context_length=config["context_length"],
+        top_k=config["top_k"],
+    )
+
+    # Decode all completions
+    completions = []
+    for i in range(sequence_ids.size(0)):
+        completion = tokenizer.decode(sequence_ids[i].tolist())
+        completions.append(completion)
+
+    # Create action mask
+    action_mask = torch.zeros_like(sequence_ids, dtype=torch.bool)
+    action_mask[:, input_ids.shape[1] :] = True
+    action_mask[sequence_ids == eot_token_id] = False
+    action_mask = action_mask[:, 1:]
+
+    # Calculate rewards
+    returns = torch.zeros(config["num_rollouts"], 1, dtype=torch.float)
+    for i, completion in enumerate(completions):
+        reward = calculate_reward_for(completion)
+        returns[i] = reward
+
+    return sequence_ids, returns, action_mask, completions
+
+
+def grpo(
+    config: dict,
+    model: FaiscaGPT,
+    tokenizer: tiktoken.Encoding,
+):
+    prompt = "Alerta "
+
+    for k in range(config["training_steps"]):
+        with torch.no_grad():
+            (
+                sequence_ids,
+                returns,
+                action_mask,
+                rollout_completions,
+            ) = rollout(
+                prompt=prompt,
+                model=model,
+                tokenizer=tokenizer,
+                config=config,
+            )
+
+            print(f"Step {k} generated {len(rollout_completions)} completions")
+            print(f"Sample completions: {rollout_completions[:3]}")
+            print(f"Returns: {returns.sum().item():.2f}/{len(returns)}")
+
+            # calculate log probs from sequence_ids
+            raise NotImplementedError("Log probs not implemented")
+
+
 if __name__ == "__main__":
     tokenizer = tiktoken.get_encoding("gpt2")
     ds = hf_datasets.load_dataset("duarteocarmo/ccnews-titles-2016")
@@ -508,11 +591,11 @@ if __name__ == "__main__":
         eval_text="Presidente",
         learning_rate=3e-4,
         max_length=256,
-        max_test_size=6000,
-        max_train_size=30_000,
+        max_test_size=200,
+        max_train_size=2000,
         train_language="pt",
         url_filter=None,
-        num_epochs=10,
+        num_epochs=1,
         num_workers=0,
         qkv_bias=False,
         save_path=f"models/faisca_{current_time}.pt",
@@ -525,7 +608,7 @@ if __name__ == "__main__":
         num_heads=4,
         num_layers=4,
         eot_token="<|endoftext|>",
-        eval_num_samples=2,
+        eval_num_samples=1,
         eval_temperature=0.5,
         eval_top_k=30,
         eval_max_new_tokens=60,
@@ -535,80 +618,67 @@ if __name__ == "__main__":
         config=config,
     )
 
-    print("\n========== PRE-TRAINING ==========")
+    # print("\n========== SUPERVISED FINE-TUNING ==========")
 
-    train_dataloader, val_dataloader = create_dataloaders(
-        train_split=ds_train,
-        val_split=ds_val,
-        config=config,
-    )
+    # sft_config = deepcopy(config)
+    # sft_config.url_filter = ".pt/"
+    # sft_config.save_path = f"models/faisca_{current_time}_sft.pt"
+    # sft_config.num_epochs = 3
+    # sft_config.chart_path = f"charts/faisca_{current_time}_sft.png"
+    # sft_config.max_train_size = 10_000
+    # sft_config.max_test_size = 2_000
+    # sft_config.eval_freq = 5
 
-    model, training_losses, validation_losses, track_tokens_seen = train(
+    # sft_train_dataloader, sft_val_dataloader = create_dataloaders(
+    #     train_split=ds_train,
+    #     val_split=ds_val,
+    #     config=sft_config,
+    # )
+
+    # (
+    #     sft_model,
+    #     sft_training_losses,
+    #     sft_validation_losses,
+    #     sft_track_tokens_seen,
+    # ) = train(
+    #     model=model,
+    #     config=sft_config,
+    #     train_dataloader=sft_train_dataloader,
+    #     val_dataloader=sft_val_dataloader,
+    #     tokenizer=tokenizer,
+    # )
+
+    # save_plots_and_model(
+    #     config=sft_config,
+    #     validation_losses=sft_validation_losses,
+    #     training_losses=sft_training_losses,
+    #     track_tokens_seen=sft_track_tokens_seen,
+    #     model=sft_model,
+    # )
+
+    # print("\n========== SUPERVISED FINE-TUNING COMPLETED ==========")
+
+    # generate_samples(
+    #     model=sft_model,
+    #     tokenizer=tokenizer,
+    #     config=sft_config,
+    # )
+
+    print("\n========== REINFORCEMENT LEARNING ==========")
+
+    rl_config = {
+        "num_rollouts": 8,
+        "max_new_tokens": 60,
+        "temperature": 1.0,
+        "context_length": 128,
+        "top_k": 10,
+        "eot_token": "<|endoftext|>",
+        "device": "mps",
+        "training_steps": 3,
+    }
+
+    rl_model = grpo(
+        config=rl_config,
         model=model,
-        config=config,
-        train_dataloader=train_dataloader,
-        val_dataloader=val_dataloader,
         tokenizer=tokenizer,
-    )
-
-    save_plots_and_model(
-        config=config,
-        validation_losses=validation_losses,
-        training_losses=training_losses,
-        track_tokens_seen=track_tokens_seen,
-        model=model,
-    )
-
-    print("\n========== PRE-TRAINING COMPLETED ==========")
-
-    generate_samples(
-        model=model,
-        tokenizer=tokenizer,
-        config=config,
-    )
-
-    print("\n========== SUPERVISED FINE-TUNING ==========")
-
-    sft_config = deepcopy(config)
-    sft_config.url_filter = ".pt/"
-    sft_config.save_path = f"models/faisca_{current_time}_sft.pt"
-    sft_config.num_epochs = 3
-    sft_config.chart_path = f"charts/faisca_{current_time}_sft.png"
-    sft_config.max_train_size = 10_000
-    sft_config.max_test_size = 2_000
-    sft_config.eval_freq = 5
-
-    sft_train_dataloader, sft_val_dataloader = create_dataloaders(
-        train_split=ds_train,
-        val_split=ds_val,
-        config=sft_config,
-    )
-
-    (
-        sft_model,
-        sft_training_losses,
-        sft_validation_losses,
-        sft_track_tokens_seen,
-    ) = train(
-        model=model,
-        config=sft_config,
-        train_dataloader=sft_train_dataloader,
-        val_dataloader=sft_val_dataloader,
-        tokenizer=tokenizer,
-    )
-
-    save_plots_and_model(
-        config=sft_config,
-        validation_losses=sft_validation_losses,
-        training_losses=sft_training_losses,
-        track_tokens_seen=sft_track_tokens_seen,
-        model=sft_model,
-    )
-
-    print("\n========== SUPERVISED FINE-TUNING COMPLETED ==========")
-
-    generate_samples(
-        model=sft_model,
-        tokenizer=tokenizer,
-        config=sft_config,
     )
