@@ -1,5 +1,6 @@
 import os
 import typing as t
+from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -7,6 +8,7 @@ import matplotlib.pyplot as plt
 import tiktoken
 import torch
 from torch import nn
+from torch.nn import functional as F
 from torch.utils.data import DataLoader, Dataset
 
 import datasets as hf_datasets
@@ -542,6 +544,45 @@ def rollout(
     return sequence_ids, returns, action_mask, completions
 
 
+def approx_kl_divergence(
+    log_probs: torch.Tensor,
+    log_probs_ref: torch.Tensor,
+    action_mask: t.Optional[torch.Tensor],
+) -> torch.Tensor:
+    """
+    Monte-Carlo approximation of KL divergence, k3 estimator, see: http://joschu.net/blog/kl-approx.html
+    """
+
+    log_ratio = log_probs_ref.float() - log_probs.float()
+    if action_mask is not None:
+        log_ratio = log_ratio * action_mask
+
+    return log_ratio.exp() - log_ratio - 1
+
+
+def sequences_log_probs(
+    model: FaiscaGPT,
+    sequence_ids: torch.Tensor,
+) -> torch.Tensor:
+    # Get logits from model
+    logits = model(sequence_ids)  # (batch_size, seq_len, vocab_size)
+
+    # Calculate log probabilities
+    log_probs = F.log_softmax(logits, dim=-1)  # (batch_size, seq_len, vocab_size)
+
+    # Get log probabilities for the actual tokens
+    # We shift by 1 because we want log prob of next token
+    target_ids = sequence_ids[:, 1:]  # (batch_size, seq_len-1)
+    log_probs = log_probs[:, :-1, :]  # (batch_size, seq_len-1, vocab_size)
+
+    # Gather log probabilities for the target tokens
+    log_probs = log_probs.gather(dim=-1, index=target_ids.unsqueeze(-1)).squeeze(
+        -1
+    )  # (batch_size, seq_len-1)
+
+    return log_probs
+
+
 def grpo(
     config: dict,
     model: FaiscaGPT,
@@ -549,7 +590,16 @@ def grpo(
 ):
     prompt = "Alerta "
 
+    reference_model = deepcopy(model)
+
+    eot_token_id = tokenizer.encode(
+        config["eot_token"], allowed_special={config["eot_token"]}
+    )[0]
+
     for k in range(config["training_steps"]):
+        replay_buffer = []
+        rollout_returns = []
+
         with torch.no_grad():
             (
                 sequence_ids,
@@ -567,8 +617,46 @@ def grpo(
             print(f"Sample completions: {rollout_completions[:3]}")
             print(f"Returns: {returns.sum().item():.2f}/{len(returns)}")
 
-            # calculate log probs from sequence_ids
-            raise NotImplementedError("Log probs not implemented")
+            advantages = (returns - returns.mean()) / (returns.std() + 1e-8)
+            attention_mask = sequence_ids != eot_token_id
+            rollout_returns.append(returns.cpu())
+
+            # TODO: Check if this needs
+            # attention mask or if we are ok
+            log_probs = sequences_log_probs(
+                model=model,
+                sequence_ids=sequence_ids,
+            )
+
+            log_probs_reference = sequences_log_probs(
+                model=reference_model,
+                sequence_ids=sequence_ids,
+            )
+
+            kl = approx_kl_divergence(
+                log_probs=log_probs,
+                log_probs_ref=log_probs_reference,
+                action_mask=action_mask,
+            )
+
+            print(f"KL: {kl.mean().item():.4f}")
+
+            replay_buffer.append(
+                {
+                    "sequences": sequence_ids,
+                    "action_log_probs": log_probs,
+                    "log_probs_ref": log_probs_reference,
+                    "returns": returns,
+                    "advantages": advantages,
+                    "attention_mask": attention_mask,
+                    "action_mask": action_mask,
+                    "kl": kl,
+                }
+            )
+
+        torch.mps.empty_cache()
+        episode_return_sum = torch.stack(rollout_returns).sum()
+        print(f"Returns of step {k}: {episode_return_sum:.4f}")
 
 
 if __name__ == "__main__":
