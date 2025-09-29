@@ -7,8 +7,10 @@ from datetime import datetime
 import matplotlib.pyplot as plt
 import tiktoken
 import torch
+import torch.optim as optim
 from torch import nn
 from torch.nn import functional as F
+from torch.nn.utils import clip_grad_norm_
 from torch.utils.data import DataLoader, Dataset
 
 import datasets as hf_datasets
@@ -513,7 +515,11 @@ def rollout(
     attention_mask = attention_mask.repeat(config["num_rollouts"], 1)
     input_ids = input_ids.repeat(config["num_rollouts"], 1)
 
+    input_ids = input_ids.to(config["device"])
+    attention_mask = attention_mask.to(config["device"])
+
     # Generate sequences
+    model.eval()
     sequence_ids = generate_single_sample(
         model=model,
         encoded=input_ids,
@@ -583,18 +589,94 @@ def sequences_log_probs(
     return log_probs
 
 
+def zero_pad_sequences(
+    sequences: list[torch.Tensor], side: str = "left"
+) -> torch.Tensor:
+    assert side in ("left", "right")
+    max_len = max(seq.size(0) for seq in sequences)
+    padded_sequences = []
+    for seq in sequences:
+        pad_len = max_len - seq.size(0)
+        padding = (pad_len, 0) if side == "left" else (0, pad_len)
+        padded_sequences.append(F.pad(seq, padding))
+    return torch.stack(padded_sequences, dim=0)
+
+
+class GRPOLoss(nn.Module):
+    """GRPO actor loss"""
+
+    def __init__(self, clip_eps: float, kl_weight: float) -> None:
+        super().__init__()
+        self.clip_eps = clip_eps
+        self.kl_weight = kl_weight
+
+    def forward(
+        self,
+        log_probs: torch.Tensor,
+        experience: dict,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        old_log_probs = experience.action_log_probs
+        log_probs_ref = experience.log_probs_ref
+        action_mask = experience.action_mask
+        advantages = experience.advantages
+
+        kl = approx_kl_divergence(
+            log_probs=log_probs,
+            log_probs_ref=log_probs_ref,
+            action_mask=action_mask,
+        )
+
+        ratio = (log_probs - old_log_probs).exp()
+        surr1 = ratio * advantages
+        surr2 = ratio.clamp(1 - self.clip_eps, 1 + self.clip_eps) * advantages
+        loss = -torch.min(surr1, surr2) + self.kl_weight * kl
+
+        if action_mask is None:
+            loss = loss.mean(axis=1)
+        else:
+            loss = (loss * action_mask).sum(axis=1) / action_mask.sum(axis=1)
+
+        return loss, kl.mean()
+
+
+def join_experience_batch(items: list[dict]) -> dict:
+    batch_data = {}
+    keys = (
+        "sequences",
+        "action_log_probs",
+        "log_probs_ref",
+        "returns",
+        "advantages",
+        "attention_mask",
+        "action_mask",
+    )
+    for key in keys:
+        vals = [item[key] for item in items]
+        if all(v is not None for v in vals):
+            data = zero_pad_sequences(vals, "left")
+        else:
+            data = None
+        batch_data[key] = data
+    return batch_data
+
+
 def grpo(
     config: dict,
     model: FaiscaGPT,
     tokenizer: tiktoken.Encoding,
 ):
     prompt = "Alerta "
+    optimizer = optim.Adam(model.parameters(), lr=config["learning_rate"])
+    objective = GRPOLoss(clip_eps=config["clip_eps"], kl_weight=config["kl_weight"])
 
     reference_model = deepcopy(model)
 
     eot_token_id = tokenizer.encode(
         config["eot_token"], allowed_special={config["eot_token"]}
     )[0]
+
+    step_rewards = []
+    step_kl_divergences = []
 
     for k in range(config["training_steps"]):
         replay_buffer = []
@@ -658,6 +740,95 @@ def grpo(
         episode_return_sum = torch.stack(rollout_returns).sum()
         print(f"Returns of step {k}: {episode_return_sum:.4f}")
 
+        step_rewards.append(episode_return_sum.item())
+
+        experience_sampler = DataLoader(
+            replay_buffer,
+            batch_size=config["train_batch_size"],
+            shuffle=True,
+            drop_last=True,
+            collate_fn=join_experience_batch,
+        )
+
+        step_kl_values = []
+
+        for step_epoch in range(config["epochs_per_step"]):
+            model.train()
+
+            for exp in experience_sampler:
+                print(exp)
+
+                optimizer.zero_grad()
+
+                log_probs = sequences_log_probs(
+                    model=model,
+                    sequence_ids=exp["sequences"],
+                )
+
+                loss, kl = objective(log_probs=log_probs, experience=exp)
+
+                if not loss.isfinite():
+                    print(f"Loss not finite, skipping backward, loss={loss}")
+                    continue
+
+                loss.backward()
+                grad_norm = clip_grad_norm_(
+                    model.parameters(), max_norm=config["max_norm"]
+                )
+                print(f"{step_epoch}: kl={kl: .4f}, grad_norm={grad_norm: .4f}")
+
+                optimizer.step()
+                step_kl_values.append(kl.item())
+
+        if step_kl_values:
+            avg_kl = sum(step_kl_values) / len(step_kl_values)
+            step_kl_divergences.append(avg_kl)
+
+        print("\nGenerating training plots...")
+
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8))
+
+    # Plot rewards
+    steps = list(range(len(step_rewards)))
+    ax1.plot(steps, step_rewards, "b-", linewidth=2, marker="o", markersize=4)
+    ax1.set_xlabel("Training Step")
+    ax1.set_ylabel("Total Rewards")
+    ax1.set_title("Sentiment Training: Rewards Over Time")
+    ax1.grid(True, alpha=0.3)
+    ax1.set_ylim(bottom=0)
+
+    # Plot KL divergence
+    if step_kl_divergences:
+        kl_steps = list(range(len(step_kl_divergences)))
+        ax2.plot(
+            kl_steps,
+            step_kl_divergences,
+            "r-",
+            linewidth=2,
+            marker="s",
+            markersize=4,
+        )
+        ax2.set_xlabel("Training Step")
+        ax2.set_ylabel("Average KL Divergence")
+        ax2.set_title("Sentiment Training: KL Divergence Over Time")
+        ax2.grid(True, alpha=0.3)
+        ax2.set_ylim(bottom=0)
+
+    plt.tight_layout()
+    plt.savefig(config["chart_path"], dpi=300, bbox_inches="tight")
+    plt.close()
+
+    print("Training completed! Final metrics:")
+    print(f"  - Final reward: {step_rewards[-1]:.2f}")
+    print(
+        f"  - Final KL divergence: {step_kl_divergences[-1]:.4f}"
+        if step_kl_divergences
+        else "  - No KL divergence data"
+    )
+    print("  - Training plots saved to: training_metrics.png")
+
+    return model, step_rewards, step_kl_divergences
+
 
 if __name__ == "__main__":
     tokenizer = tiktoken.get_encoding("gpt2")
@@ -679,8 +850,8 @@ if __name__ == "__main__":
         eval_text="Presidente",
         learning_rate=3e-4,
         max_length=256,
-        max_test_size=200,
-        max_train_size=2000,
+        max_test_size=500,
+        max_train_size=5000,
         train_language="pt",
         url_filter=None,
         num_epochs=1,
@@ -706,51 +877,77 @@ if __name__ == "__main__":
         config=config,
     )
 
-    # print("\n========== SUPERVISED FINE-TUNING ==========")
+    print("\n========== PRE-TRAINING ==========")
 
-    # sft_config = deepcopy(config)
-    # sft_config.url_filter = ".pt/"
-    # sft_config.save_path = f"models/faisca_{current_time}_sft.pt"
-    # sft_config.num_epochs = 3
-    # sft_config.chart_path = f"charts/faisca_{current_time}_sft.png"
-    # sft_config.max_train_size = 10_000
-    # sft_config.max_test_size = 2_000
-    # sft_config.eval_freq = 5
+    train_dataloader, val_dataloader = create_dataloaders(
+        train_split=ds_train,
+        val_split=ds_val,
+        config=config,
+    )
 
-    # sft_train_dataloader, sft_val_dataloader = create_dataloaders(
-    #     train_split=ds_train,
-    #     val_split=ds_val,
-    #     config=sft_config,
-    # )
+    model, training_losses, validation_losses, track_tokens_seen = train(
+        model=model,
+        config=config,
+        train_dataloader=train_dataloader,
+        val_dataloader=val_dataloader,
+        tokenizer=tokenizer,
+    )
 
-    # (
-    #     sft_model,
-    #     sft_training_losses,
-    #     sft_validation_losses,
-    #     sft_track_tokens_seen,
-    # ) = train(
-    #     model=model,
-    #     config=sft_config,
-    #     train_dataloader=sft_train_dataloader,
-    #     val_dataloader=sft_val_dataloader,
-    #     tokenizer=tokenizer,
-    # )
+    save_plots_and_model(
+        config=config,
+        validation_losses=validation_losses,
+        training_losses=training_losses,
+        track_tokens_seen=track_tokens_seen,
+        model=model,
+    )
 
-    # save_plots_and_model(
-    #     config=sft_config,
-    #     validation_losses=sft_validation_losses,
-    #     training_losses=sft_training_losses,
-    #     track_tokens_seen=sft_track_tokens_seen,
-    #     model=sft_model,
-    # )
+    print("\n========== PRE-TRAINING COMPLETED ==========")
 
-    # print("\n========== SUPERVISED FINE-TUNING COMPLETED ==========")
+    print("\n========== SUPERVISED FINE-TUNING ==========")
 
-    # generate_samples(
-    #     model=sft_model,
-    #     tokenizer=tokenizer,
-    #     config=sft_config,
-    # )
+    sft_config = deepcopy(config)
+    sft_config.url_filter = ".pt/"
+    sft_config.save_path = f"models/faisca_{current_time}_sft.pt"
+    sft_config.num_epochs = 3
+    sft_config.chart_path = f"charts/faisca_{current_time}_sft.png"
+    sft_config.max_train_size = 5_000
+    sft_config.max_test_size = 500
+    sft_config.eval_freq = 5
+
+    sft_train_dataloader, sft_val_dataloader = create_dataloaders(
+        train_split=ds_train,
+        val_split=ds_val,
+        config=sft_config,
+    )
+
+    (
+        sft_model,
+        sft_training_losses,
+        sft_validation_losses,
+        sft_track_tokens_seen,
+    ) = train(
+        model=model,
+        config=sft_config,
+        train_dataloader=sft_train_dataloader,
+        val_dataloader=sft_val_dataloader,
+        tokenizer=tokenizer,
+    )
+
+    save_plots_and_model(
+        config=sft_config,
+        validation_losses=sft_validation_losses,
+        training_losses=sft_training_losses,
+        track_tokens_seen=sft_track_tokens_seen,
+        model=sft_model,
+    )
+
+    print("\n========== SUPERVISED FINE-TUNING COMPLETED ==========")
+
+    generate_samples(
+        model=sft_model,
+        tokenizer=tokenizer,
+        config=sft_config,
+    )
 
     print("\n========== REINFORCEMENT LEARNING ==========")
 
@@ -763,10 +960,19 @@ if __name__ == "__main__":
         "eot_token": "<|endoftext|>",
         "device": "mps",
         "training_steps": 3,
+        "train_batch_size": 8,
+        "epochs_per_step": 1,
+        "learning_rate": 5e-6,
+        "clip_eps": 0.2,
+        "kl_weight": 0.01,
+        "max_norm": 1.0,
+        "chart_path": f"charts/faisca_{current_time}_rl.png",
     }
 
     rl_model = grpo(
         config=rl_config,
-        model=model,
+        model=sft_model,
         tokenizer=tokenizer,
     )
+
+    print("\n========== REINFORCEMENT LEARNING COMPLETED ==========")
