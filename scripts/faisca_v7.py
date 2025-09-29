@@ -1047,20 +1047,28 @@ if __name__ == "__main__":
 
     print("\n========== REINFORCEMENT LEARNING ==========")
 
+    # load model from file
+    # sft_model = FaiscaGPT(
+    #     config=sft_config,
+    # )
+    # sft_model.load_state_dict(
+    #     torch.load("models/faisca_2025-09-29_21-45-06_sft.pt", map_location="cpu")
+    # )
+
     rl_config = {
-        "num_rollouts": 8,
+        "num_rollouts": 24,
         "max_new_tokens": 60,
-        "temperature": 1.0,
+        "temperature": 0.8,
         "context_length": 128,
         "top_k": 10,
         "eot_token": "<|endoftext|>",
         "device": "mps",
         "training_steps": 12,
-        "train_batch_size": 16,
+        "train_batch_size": 12,
         "epochs_per_step": 4,
         "learning_rate": 5e-6,
         "clip_eps": 0.2,
-        "kl_weight": 0.01,
+        "kl_weight": 0.02,
         "max_norm": 1.0,
         "chart_path": f"charts/faisca_{current_time}_rl.png",
     }
