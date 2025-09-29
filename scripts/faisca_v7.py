@@ -1,8 +1,9 @@
 import os
 import typing as t
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from datetime import datetime
+from typing import Optional, Self
 
 import matplotlib.pyplot as plt
 import tiktoken
@@ -103,9 +104,7 @@ class CCTitleDataset(Dataset):
             perm = torch.randperm(len(titles), generator=g).tolist()
             titles = [titles[i] for i in perm]
 
-        eot_id = tokenizer.encode(
-            self.EOT_TOKEN, allowed_special={self.EOT_TOKEN}
-        )[0]
+        eot_id = tokenizer.encode(self.EOT_TOKEN, allowed_special={self.EOT_TOKEN})[0]
         ids: list[int] = []
         for doc in titles:
             toks = tokenizer.encode(doc, allowed_special={self.EOT_TOKEN})
@@ -131,9 +130,7 @@ class CCTitleDataset(Dataset):
 
 
 class FeedForward(nn.Module):
-    def __init__(
-        self, embedding_dimension: int, hidden_expansion_factor: int = 4
-    ):
+    def __init__(self, embedding_dimension: int, hidden_expansion_factor: int = 4):
         super().__init__()
         self.layers = nn.Sequential(
             nn.Linear(
@@ -180,9 +177,7 @@ class TransformerBlock(nn.Module):
         x = self.norm1(x)
 
         L = x.size(1)
-        causal = torch.triu(
-            torch.ones(L, L, dtype=torch.bool, device=x.device), 1
-        )
+        causal = torch.triu(torch.ones(L, L, dtype=torch.bool, device=x.device), 1)
         x, _ = self.attention(x, x, x, attn_mask=causal)
         x = self.drop_shortcut(x)
         x = x + shortcut
@@ -281,9 +276,7 @@ def create_dataloaders(
         num_workers=config.num_workers,
         pin_memory=True,
     )
-    train_loader = DataLoader(
-        train_ds, shuffle=config.dataloader_shuffle, **common
-    )
+    train_loader = DataLoader(train_ds, shuffle=config.dataloader_shuffle, **common)
     val_loader = DataLoader(val_ds, shuffle=False, **common)
     return train_loader, val_loader
 
@@ -310,9 +303,7 @@ def generate_samples(
     with torch.no_grad():
         encoded = (
             torch.tensor(
-                tokenizer.encode(
-                    config.eval_text, allowed_special={config.eot_token}
-                ),
+                tokenizer.encode(config.eval_text, allowed_special={config.eot_token}),
                 dtype=torch.long,
             )
             .unsqueeze(0)
@@ -333,9 +324,7 @@ def generate_samples(
             decoded = decoded.replace("\n", " ").strip()
             instances = decoded.split(config.eot_token)  # split at eot token
 
-            print(
-                f"**** GENERATION {gen_num + 1} OF {config.eval_num_samples} ****"
-            )
+            print(f"**** GENERATION {gen_num + 1} OF {config.eval_num_samples} ****")
             for instance in instances:
                 print(f"> '{instance}'")
             print("*" * 25)
@@ -417,9 +406,7 @@ def train(
                         ("validation", val_dataloader),
                     ]:
                         total_split_loss = 0
-                        for i, (input_batch, target_batch) in enumerate(
-                            dataloader
-                        ):
+                        for i, (input_batch, target_batch) in enumerate(dataloader):
                             if i < config.eval_iter:
                                 loss = calculate_loss(
                                     input_batch=input_batch,
@@ -506,14 +493,103 @@ def save_plots_and_model(
 
 
 def calculate_reward_for(text: str) -> float:
-    return 1.0 if "!" in text else 0.0
+    target_words = [
+        "futebol",
+        "benfica",
+        "porto",
+        "sporting",
+        "bola",
+        "liga",
+        "campeão",
+        "taça",
+        "golo",
+        "jogo",
+        "jogador",
+        "treinador",
+        "fifa",
+        "uefa",
+        "euro",
+        "messi",
+        "ronaldo",
+    ]
+    has_word = set(text.lower().split()).intersection(set(target_words))
+    return 1.0 if has_word else 0.0
+
+
+@dataclass
+class Experience:
+    sequences: torch.Tensor
+    action_log_probs: torch.Tensor
+    log_probs_ref: torch.Tensor
+    returns: Optional[torch.Tensor]
+    advantages: Optional[torch.Tensor]
+    attention_mask: Optional[torch.Tensor]
+    action_mask: torch.Tensor
+    kl: Optional[torch.Tensor] = None
+
+    def to(self, device: torch.device) -> Self:
+        members = {}
+        for field in fields(self):
+            v = getattr(self, field.name)
+            if isinstance(v, torch.Tensor):
+                v = v.to(device=device)
+            members[field.name] = v
+        return Experience(**members)
+
+
+def split_experience_batch(experience: Experience) -> list[Experience]:
+    batch_size = experience.sequences.size(0)
+    batch_data = [{} for _ in range(batch_size)]
+    keys = (
+        "sequences",
+        "action_log_probs",
+        "log_probs_ref",
+        "returns",
+        "advantages",
+        "attention_mask",
+        "action_mask",
+    )
+    for key in keys:
+        value = getattr(experience, key)
+        if value is None:
+            vals = [None] * batch_size
+        else:
+            vals = torch.unbind(value)
+        assert batch_size == len(vals)
+        for i, v in enumerate(vals):
+            batch_data[i][key] = v
+
+    return [Experience(**data) for data in batch_data]
+
+
+class ReplayBuffer:
+    def __init__(self, limit: int = 0) -> None:
+        self.limit = limit
+        self.items: list[Experience] = []
+
+    def append(self, experience: Experience) -> None:
+        items = split_experience_batch(experience)
+        self.items.extend(items)
+        if self.limit > 0:
+            samples_to_remove = len(self.items) - self.limit
+            if samples_to_remove > 0:
+                self.items = self.items[samples_to_remove:]
+
+    def clear(self) -> None:
+        self.items.clear()
+
+    def __len__(self) -> int:
+        return len(self.items)
+
+    def __getitem__(self, idx: int) -> Experience:
+        return self.items[idx]
 
 
 def rollout(
     prompt: str,
     model: FaiscaGPT,
     tokenizer: tiktoken.Encoding,
-    config: Config,
+    config: dict,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[str]]:
     # Get token IDs
     eot_token_id = tokenizer.encode(
@@ -588,9 +664,7 @@ def sequences_log_probs(
     logits = model(sequence_ids)  # (batch_size, seq_len, vocab_size)
 
     # Calculate log probabilities
-    log_probs = F.log_softmax(
-        logits, dim=-1
-    )  # (batch_size, seq_len, vocab_size)
+    log_probs = F.log_softmax(logits, dim=-1)  # (batch_size, seq_len, vocab_size)
 
     # Get log probabilities for the actual tokens
     # We shift by 1 because we want log prob of next token
@@ -598,9 +672,9 @@ def sequences_log_probs(
     log_probs = log_probs[:, :-1, :]  # (batch_size, seq_len-1, vocab_size)
 
     # Gather log probabilities for the target tokens
-    log_probs = log_probs.gather(
-        dim=-1, index=target_ids.unsqueeze(-1)
-    ).squeeze(-1)  # (batch_size, seq_len-1)
+    log_probs = log_probs.gather(dim=-1, index=target_ids.unsqueeze(-1)).squeeze(
+        -1
+    )  # (batch_size, seq_len-1)
 
     return log_probs
 
@@ -618,6 +692,16 @@ def zero_pad_sequences(
     return torch.stack(padded_sequences, dim=0)
 
 
+def masked_mean(
+    tensor: torch.Tensor,
+    mask: Optional[torch.Tensor],
+    dim: int = None,
+) -> torch.Tensor:
+    if mask is None:
+        return tensor.mean(axis=dim)
+    return (tensor * mask).sum(axis=dim) / mask.sum(axis=dim)
+
+
 class GRPOLoss(nn.Module):
     """GRPO actor loss"""
 
@@ -629,7 +713,7 @@ class GRPOLoss(nn.Module):
     def forward(
         self,
         log_probs: torch.Tensor,
-        experience: dict,
+        experience: Experience,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         old_log_probs = experience.action_log_probs
         log_probs_ref = experience.log_probs_ref
@@ -646,16 +730,12 @@ class GRPOLoss(nn.Module):
         surr1 = ratio * advantages
         surr2 = ratio.clamp(1 - self.clip_eps, 1 + self.clip_eps) * advantages
         loss = -torch.min(surr1, surr2) + self.kl_weight * kl
-
-        if action_mask is None:
-            loss = loss.mean(axis=1)
-        else:
-            loss = (loss * action_mask).sum(axis=1) / action_mask.sum(axis=1)
+        loss = masked_mean(loss, action_mask, dim=-1).mean()
 
         return loss, kl.mean()
 
 
-def join_experience_batch(items: list[dict]) -> dict:
+def join_experience_batch(items: list[Experience]) -> Experience:
     batch_data = {}
     keys = (
         "sequences",
@@ -667,13 +747,13 @@ def join_experience_batch(items: list[dict]) -> dict:
         "action_mask",
     )
     for key in keys:
-        vals = [item[key] for item in items]
+        vals = [getattr(item, key) for item in items]
         if all(v is not None for v in vals):
             data = zero_pad_sequences(vals, "left")
         else:
             data = None
         batch_data[key] = data
-    return batch_data
+    return Experience(**batch_data)
 
 
 def grpo(
@@ -683,11 +763,13 @@ def grpo(
 ):
     prompt = "Alerta "
     optimizer = optim.Adam(model.parameters(), lr=config["learning_rate"])
-    objective = GRPOLoss(
-        clip_eps=config["clip_eps"], kl_weight=config["kl_weight"]
-    )
+    objective = GRPOLoss(clip_eps=config["clip_eps"], kl_weight=config["kl_weight"])
+    cpu_device = torch.device("cpu")
 
     reference_model = deepcopy(model)
+
+    model.to(config["device"])
+    reference_model.to(config["device"])
 
     eot_token_id = tokenizer.encode(
         config["eot_token"], allowed_special={config["eot_token"]}
@@ -697,7 +779,7 @@ def grpo(
     step_kl_divergences = []
 
     for k in range(config["training_steps"]):
-        replay_buffer = []
+        replay_buffer = ReplayBuffer()
         rollout_returns = []
 
         with torch.no_grad():
@@ -739,20 +821,17 @@ def grpo(
                 action_mask=action_mask,
             )
 
-            print(f"KL: {kl.mean().item():.4f}")
-
-            replay_buffer.append(
-                {
-                    "sequences": sequence_ids,
-                    "action_log_probs": log_probs,
-                    "log_probs_ref": log_probs_reference,
-                    "returns": returns,
-                    "advantages": advantages,
-                    "attention_mask": attention_mask,
-                    "action_mask": action_mask,
-                    "kl": kl,
-                }
+            exp = Experience(
+                sequences=sequence_ids,
+                action_log_probs=log_probs,
+                log_probs_ref=log_probs_reference,
+                returns=returns,
+                advantages=advantages,
+                attention_mask=attention_mask,
+                action_mask=action_mask,
+                kl=kl,
             )
+            replay_buffer.append(exp.to(cpu_device))
 
         torch.mps.empty_cache()
         episode_return_sum = torch.stack(rollout_returns).sum()
@@ -773,15 +852,15 @@ def grpo(
         for step_epoch in range(config["epochs_per_step"]):
             model.train()
 
-            for exp in experience_sampler:
-                print(exp)
-                breakpoint()
-
+            for index, exp in enumerate(experience_sampler):
+                print(f"Processing experience {index} of {len(experience_sampler)}")
+                exp: Experience
                 optimizer.zero_grad()
+                exp = exp.to(torch.device(config["device"]))
 
                 log_probs = sequences_log_probs(
                     model=model,
-                    sequence_ids=exp["sequences"],
+                    sequence_ids=exp.sequences,
                 )
 
                 loss, kl = objective(log_probs=log_probs, experience=exp)
@@ -794,9 +873,7 @@ def grpo(
                 grad_norm = clip_grad_norm_(
                     model.parameters(), max_norm=config["max_norm"]
                 )
-                print(
-                    f"{step_epoch}: kl={kl: .4f}, grad_norm={grad_norm: .4f}"
-                )
+                print(f"{step_epoch}: kl={kl: .4f}, grad_norm={grad_norm: .4f}")
 
                 optimizer.step()
                 step_kl_values.append(kl.item())
@@ -870,10 +947,8 @@ if __name__ == "__main__":
         eval_text="Presidente",
         learning_rate=3e-4,
         max_length=256,
-        # max_test_size=6000,
-        # max_train_size=30_000,
-        max_test_size=500,
-        max_train_size=2000,
+        max_test_size=6000,
+        max_train_size=30_000,
         train_language="pt",
         url_filter=None,
         num_epochs=10,
@@ -898,7 +973,6 @@ if __name__ == "__main__":
     model = FaiscaGPT(
         config=config,
     )
-
     print("\n========== PRE-TRAINING ==========")
 
     train_dataloader, val_dataloader = create_dataloaders(
@@ -932,10 +1006,8 @@ if __name__ == "__main__":
     sft_config.save_path = f"models/faisca_{current_time}_sft.pt"
     sft_config.num_epochs = 5
     sft_config.chart_path = f"charts/faisca_{current_time}_sft.png"
-    # sft_config.max_train_size = 20_000
-    # sft_config.max_test_size = 4000
-    sft_config.max_train_size = 1000
-    sft_config.max_test_size = 200
+    sft_config.max_train_size = 20_000
+    sft_config.max_test_size = 4000
     sft_config.eval_freq = 5
 
     sft_train_dataloader, sft_val_dataloader = create_dataloaders(
@@ -983,9 +1055,9 @@ if __name__ == "__main__":
         "top_k": 10,
         "eot_token": "<|endoftext|>",
         "device": "mps",
-        "training_steps": 10,
-        "train_batch_size": 8,
-        "epochs_per_step": 1,
+        "training_steps": 12,
+        "train_batch_size": 16,
+        "epochs_per_step": 4,
         "learning_rate": 5e-6,
         "clip_eps": 0.2,
         "kl_weight": 0.01,
