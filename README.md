@@ -33,10 +33,11 @@ You can tweak the config/hyperparameters at the bottom of the script.
 
 _Note: I only tested this on my MacBook Pro (~64GB of RAM)_
 
-## Example dataset: Portuguese news headlines 🇵🇹
+## Example dataset/model: Portuguese news headlines 🇵🇹
 
 This code is meant to be changed and adapted. But the example uses a [dataset](https://huggingface.co/datasets/duarteocarmo/ccnews-titles-2016) of headlines in Portuguese (different variants) from CommonCrawl (`ccnews`).
 
+- The GPT model is small: ~13M parameters (4 heads, 4 layers, 128 embedding size)
 - **Pre-training**: Pre-train in ~30K headlines, for about 10 epochs.
 - **SFT**: Fine-tune in ~20K headlines in Portuguese from Portugal
 - **RL**: Uses a reward model that rewards headlines that include anything related to Portuguese football (soccer).

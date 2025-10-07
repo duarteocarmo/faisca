@@ -11,3 +11,4 @@ output
 src/faisca/__pycache__
 charts
 __pycache__
+*.npz
