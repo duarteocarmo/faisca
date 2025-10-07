@@ -1,3 +1,7 @@
+<center>
+  <img src="./readme/logo.png" alt="Faísca logo" />
+</center>
+
 # ⚡️ Faísca - The modern LLM stack in 1000 lines of code
 
 Faísca is a small uv script that implements the "modern" LLM stack in about 1000 lines of code. It includes:
