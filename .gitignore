@@ -3,10 +3,10 @@ venv/
 *.pdf
 *.txt
 *.pt
-*.png
 *aider*
 
 .DS_Store
 scripts/__pycache__
 output
 src/faisca/__pycache__
+charts

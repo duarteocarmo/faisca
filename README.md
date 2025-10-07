@@ -34,6 +34,20 @@ This code is meant to be changed and adapted. But the example uses a [dataset](h
 - **SFT**: Fine-tune in ~20K headlines in Portuguese from Portugal
 - **RL**: Uses a reward model that rewards headlines that include anything related to Portuguese football (soccer).
 
+## Training screenshots
+
+### Pre-training
+
+![Pre-training screenshot](./readme/faisca_2025-10-04_22-02-58.png)
+
+### SFT
+
+![SFT screenshot](./readme/faisca_2025-10-04_22-02-58_sft.png)
+
+### RL with GRPO
+
+![RL screenshot](./readme/faisca_2025-10-07_20-21-27_rl.png)
+
 ## TODO
 
 - [ ] Make MLX version of the script
