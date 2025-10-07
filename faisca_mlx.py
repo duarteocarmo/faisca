@@ -228,12 +228,10 @@ class TransformerBlock(nn.Module):
         self.dropout1 = nn.Dropout(p=dropout_rate)
         self.dropout2 = nn.Dropout(p=dropout_rate)
 
-    def __call__(self, x: mx.array) -> mx.array:
+    def __call__(self, x: mx.array, mask: mx.array) -> mx.array:
         shortcut = x
         x = self.norm1(x)
 
-        seq_len = x.shape[1]
-        mask = nn.MultiHeadAttention.create_additive_causal_mask(seq_len)
         x = self.attention(x, x, x, mask=mask)
         x = self.dropout1(x)
         x = x + shortcut
@@ -279,6 +277,11 @@ class FaiscaGPT(nn.Module):
 
     def __call__(self, in_idx: mx.array) -> mx.array:
         _, sequence_length = in_idx.shape
+
+        # Create causal mask once
+        mask = nn.MultiHeadAttention.create_additive_causal_mask(sequence_length)
+        mask = mask.astype(self.token_embedding.weight.dtype)
+
         token_embeddings = self.token_embedding(in_idx)
         positional_embeddings = self.positional_embedding(
             mx.arange(sequence_length, dtype=mx.int32)
@@ -287,7 +290,7 @@ class FaiscaGPT(nn.Module):
         x = token_embeddings + positional_embeddings
         x = self.dropout_embedding(x)
         for block in self.transformer_blocks:
-            x = block(x)
+            x = block(x, mask)
         x = self.final_layer_norm(x)
         logits = self.out_head(x)
         return logits
@@ -405,6 +408,9 @@ def generate_single_sample(
 
         generated = mx.concatenate([generated, idx_next], axis=1)
 
+        # Evaluate to prevent computation graph buildup
+        mx.eval(generated)
+
         if stop_at_eot is not None and int(idx_next[0, 0].item()) == stop_at_eot:
             break
 
@@ -441,6 +447,7 @@ def train(
 
         for input_batch, target_batch in train_dataloader:
             loss_value, grads = loss_and_grad_fn(model, input_batch, target_batch)
+            mx.eval(loss_value)
             optimizer.update(model, grads)
             mx.eval(model.parameters(), optimizer.state)
 
@@ -649,6 +656,8 @@ def rollout(
             top_k=config["top_k"],
         )
 
+    mx.eval(sequence_ids)
+
     completions = [
         tokenizer.decode(sequence_ids[i].tolist()) for i in range(sequence_ids.shape[0])
     ]
@@ -663,6 +672,8 @@ def rollout(
 
     returns_values = [calculate_reward_for(text) for text in completions]
     returns = mx.array(returns_values, dtype=mx.float32).reshape(-1, 1)
+
+    mx.eval(returns, action_mask)
 
     return sequence_ids, returns, action_mask, completions
 
@@ -690,7 +701,9 @@ def sequences_log_probs(
     gathered = mx.take_along_axis(
         log_probs, mx.expand_dims(target_ids, axis=-1), axis=-1
     )
-    return mx.squeeze(gathered, axis=-1)
+    result = mx.squeeze(gathered, axis=-1)
+    mx.eval(result)
+    return result
 
 
 def zero_pad_sequences(sequences: list[mx.array], side: str = "left") -> mx.array:
@@ -896,6 +909,8 @@ def grpo(
         attention_mask = mx.not_equal(sequence_ids, eot_token_id)
         rollout_returns.append(returns)
 
+        mx.eval(advantages, attention_mask)
+
         log_probs = sequences_log_probs(
             model=model,
             sequence_ids=sequence_ids,
@@ -911,6 +926,8 @@ def grpo(
             log_probs_ref=log_probs_reference,
             action_mask=action_mask,
         )
+
+        mx.eval(kl)
 
         exp = Experience(
             sequences=sequence_ids,
@@ -953,6 +970,7 @@ def grpo(
                     sequence_ids=exp_batch.sequences,
                 )
                 _, kl_value = objective(log_probs_updated, exp_batch)
+                mx.eval(kl_value)
 
                 print(
                     f"{step_epoch}: kl={float(kl_value.item()): .4f}, "
@@ -964,6 +982,9 @@ def grpo(
         if step_kl_values:
             avg_kl = sum(step_kl_values) / len(step_kl_values)
             step_kl_divergences.append(avg_kl)
+
+        # Clear cache after each training step
+        mx.clear_cache()
 
     print("\nGenerating training plots...")
     _, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8))
@@ -1041,11 +1062,11 @@ if __name__ == "__main__":
         eval_text="Presidente",
         learning_rate=3e-4,
         max_length=256,
-        max_test_size=1000,
-        max_train_size=5000,
+        max_test_size=6000,
+        max_train_size=30_000,
         train_language="pt",
         url_filter=None,
-        num_epochs=1,
+        num_epochs=10,
         num_workers=0,
         qkv_bias=False,
         save_path=f"models/faisca_{current_time}.npz",
@@ -1102,10 +1123,10 @@ if __name__ == "__main__":
     sft_config = deepcopy(config)
     sft_config.url_filter = ".pt/"
     sft_config.save_path = f"models/faisca_{current_time}_sft.npz"
-    sft_config.num_epochs = 1
+    sft_config.num_epochs = 5
     sft_config.chart_path = f"charts/faisca_{current_time}_sft.png"
-    sft_config.max_train_size = 1000
-    sft_config.max_test_size = 200
+    sft_config.max_train_size = 20_000
+    sft_config.max_test_size = 4000
     sft_config.eval_freq = 5
 
     sft_train_dataloader, sft_val_dataloader = create_dataloaders(
@@ -1154,7 +1175,7 @@ if __name__ == "__main__":
         "context_length": 128,
         "top_k": 30,
         "eot_token": "<|endoftext|>",
-        "training_steps": 2,
+        "training_steps": 18,
         "train_batch_size": 12,
         "epochs_per_step": 4,
         "learning_rate": 1e-5,
