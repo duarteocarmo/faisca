@@ -1,6 +1,4 @@
-<center>
-  <img src="./readme/logo.png" alt="Faísca logo" />
-</center>
+![Logo](./readme/logo.png)
 
 # ⚡️ Faísca - The modern LLM stack in 1000 lines of code
 
