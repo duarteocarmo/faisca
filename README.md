@@ -2,29 +2,48 @@
 
 Faísca is a small uv script, without any dependencies, that implements the "modern" LLM stack in about 1000 lines of code. It includes:
 
-
-- Pre-training a GPT model from scratch 
+- Pre-training a GPT model from scratch
 - Supervised fine-tuning (SFT)
-- Reinforcement learning with [GRPO](https://en.wikipedia.org/wiki/Policy_gradient_method#Group_Relative_Policy_Optimization_(GRPO))
+- Reinforcement learning with [GRPO](<https://en.wikipedia.org/wiki/Policy_gradient_method#Group_Relative_Policy_Optimization_(GRPO)>)
 
+I've included a PyTorch version, and a MLX version of the code. The MLX version is completely vibed by Codex, so take it with a grain of slop.
 
+## Usage
 
+All you need to get this running is [uv](https://docs.astral.sh/uv/getting-started/installation/).
 
+PyTorch version:
 
+```bash
+$ uv run faisca_torch.py
+```
 
+MLX version:
 
-## TODO 
+```bash
+$ uv run faisca_mlx.py
+```
+
+_Note: I only tested this on my MacBook Pro (~64GB of RAM)_
+
+## Example dataset
+
+This code is meant to be changed and adapted. But the example uses a [dataset](https://huggingface.co/datasets/duarteocarmo/ccnews-titles-2016) of headlines in Portuguese (different variants) from CommonCrawl (`ccnews`).
+
+- **Pre-training**: Pre-train in ~30K headlines, for about 10 epochs.
+- **SFT**: Fine-tune in ~20K headlines in Portuguese from Portugal
+- **RL**: Uses a reward model that rewards headlines that include anything related to Portuguese football (soccer).
+
+## TODO
 
 - [ ] Make MLX version of the script
-- [ ] Make uv-script for main scripts and delete the rest 
+- [ ] Make uv-script for main scripts and delete the rest
 - [ ] Clean up repo with old scripts, etc
 - [ ] Details to README (description, inspiration)
-- [ ] Add images to README 
+- [ ] Add images to README
 - [ ] Write short article
 
-
-
-## Places I copied code/ideas from 
+## Places I copied code/ideas from
 
 - [minGPT from Andrej Karpathy](https://github.com/karpathy/minGPT)
 - [LLMs from Scratch - Sebastian Raschka](https://github.com/rasbt/LLMs-from-scratch)
