@@ -110,7 +110,7 @@ class CCTitleDataset:
                 return {"title": None}
             return {"title": title if title else None}
 
-        hf_split = hf_split.map(process_row, num_proc=1)
+        hf_split = hf_split.map(process_row)
 
         titles = [t for t in hf_split["title"] if t is not None]
 
@@ -278,10 +278,6 @@ class FaiscaGPT(nn.Module):
     def __call__(self, in_idx: mx.array) -> mx.array:
         _, sequence_length = in_idx.shape
 
-        # Create causal mask once
-        mask = nn.MultiHeadAttention.create_additive_causal_mask(sequence_length)
-        mask = mask.astype(self.token_embedding.weight.dtype)
-
         token_embeddings = self.token_embedding(in_idx)
         positional_embeddings = self.positional_embedding(
             mx.arange(sequence_length, dtype=mx.int32)
@@ -289,6 +285,11 @@ class FaiscaGPT(nn.Module):
         positional_embeddings = mx.expand_dims(positional_embeddings, axis=0)
         x = token_embeddings + positional_embeddings
         x = self.dropout_embedding(x)
+
+        # Create causal mask once per forward pass
+        mask = nn.MultiHeadAttention.create_additive_causal_mask(sequence_length)
+        mask = mask.astype(x.dtype)
+
         for block in self.transformer_blocks:
             x = block(x, mask)
         x = self.final_layer_norm(x)
@@ -447,7 +448,6 @@ def train(
 
         for input_batch, target_batch in train_dataloader:
             loss_value, grads = loss_and_grad_fn(model, input_batch, target_batch)
-            mx.eval(loss_value)
             optimizer.update(model, grads)
             mx.eval(model.parameters(), optimizer.state)
 
@@ -501,6 +501,9 @@ def train(
             tokenizer=tokenizer,
             config=config,
         )
+
+        # Clear cache after each epoch
+        mx.clear_cache()
 
     return model, training_losses, validation_losses, track_tokens_seen
 
@@ -656,8 +659,6 @@ def rollout(
             top_k=config["top_k"],
         )
 
-    mx.eval(sequence_ids)
-
     completions = [
         tokenizer.decode(sequence_ids[i].tolist()) for i in range(sequence_ids.shape[0])
     ]
@@ -672,8 +673,6 @@ def rollout(
 
     returns_values = [calculate_reward_for(text) for text in completions]
     returns = mx.array(returns_values, dtype=mx.float32).reshape(-1, 1)
-
-    mx.eval(returns, action_mask)
 
     return sequence_ids, returns, action_mask, completions
 
@@ -701,9 +700,7 @@ def sequences_log_probs(
     gathered = mx.take_along_axis(
         log_probs, mx.expand_dims(target_ids, axis=-1), axis=-1
     )
-    result = mx.squeeze(gathered, axis=-1)
-    mx.eval(result)
-    return result
+    return mx.squeeze(gathered, axis=-1)
 
 
 def zero_pad_sequences(sequences: list[mx.array], side: str = "left") -> mx.array:
@@ -909,8 +906,6 @@ def grpo(
         attention_mask = mx.not_equal(sequence_ids, eot_token_id)
         rollout_returns.append(returns)
 
-        mx.eval(advantages, attention_mask)
-
         log_probs = sequences_log_probs(
             model=model,
             sequence_ids=sequence_ids,
@@ -926,8 +921,6 @@ def grpo(
             log_probs_ref=log_probs_reference,
             action_mask=action_mask,
         )
-
-        mx.eval(kl)
 
         exp = Experience(
             sequences=sequence_ids,
@@ -970,7 +963,6 @@ def grpo(
                     sequence_ids=exp_batch.sequences,
                 )
                 _, kl_value = objective(log_probs_updated, exp_batch)
-                mx.eval(kl_value)
 
                 print(
                     f"{step_epoch}: kl={float(kl_value.item()): .4f}, "
@@ -1088,6 +1080,7 @@ if __name__ == "__main__":
     model = FaiscaGPT(
         config=config,
     )
+    mx.eval(model.parameters())
 
     mx.clear_cache()
     print("\n========== PRE-TRAINING ==========")
