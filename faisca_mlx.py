@@ -110,7 +110,7 @@ class CCTitleDataset:
                 return {"title": None}
             return {"title": title if title else None}
 
-        hf_split = hf_split.map(process_row)
+        hf_split = hf_split.map(process_row, num_proc=1)
 
         titles = [t for t in hf_split["title"] if t is not None]
 
@@ -1041,8 +1041,8 @@ if __name__ == "__main__":
         eval_text="Presidente",
         learning_rate=3e-4,
         max_length=256,
-        max_test_size=200,
-        max_train_size=1_000,
+        max_test_size=1000,
+        max_train_size=5000,
         train_language="pt",
         url_filter=None,
         num_epochs=1,
@@ -1067,6 +1067,8 @@ if __name__ == "__main__":
     model = FaiscaGPT(
         config=config,
     )
+
+    mx.clear_cache()
     print("\n========== PRE-TRAINING ==========")
 
     train_dataloader, val_dataloader = create_dataloaders(
@@ -1094,6 +1096,7 @@ if __name__ == "__main__":
 
     print("\n========== PRE-TRAINING COMPLETED ==========")
 
+    mx.clear_cache()
     print("\n========== SUPERVISED FINE-TUNING ==========")
 
     sft_config = deepcopy(config)
@@ -1141,6 +1144,7 @@ if __name__ == "__main__":
         config=sft_config,
     )
 
+    mx.clear_cache()
     print("\n========== REINFORCEMENT LEARNING ==========")
 
     rl_config = {
