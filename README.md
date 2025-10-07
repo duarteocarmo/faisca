@@ -1,4 +1,4 @@
-# Faísca - The modern LLM stack, from scratch, in pytorch
+# ⚡️ Faísca - The modern LLM stack, from scratch, in pytorch
 
 Faísca is a simple script in ~1000 lines of code that implements the core of the modern LLM stack. Which includes: 
 
