@@ -1,8 +1,11 @@
-# ⚡️ Faísca - The modern LLM stack, from scratch, in pytorch
+# ⚡️ Faísca - The modern LLM stack in 1000 lines of code
 
-Faísca is a simple script in ~1000 lines of code that implements the core of the modern LLM stack. Which includes: 
+Faísca is a small uv script, without any dependencies, that implements the "modern" LLM stack in about 1000 lines of code. It includes:
 
-- 
+
+- Pre-training a GPT model from scratch 
+- Supervised fine-tuning (SFT)
+- Reinforcement learning with [GRPO](https://en.wikipedia.org/wiki/Policy_gradient_method#Group_Relative_Policy_Optimization_(GRPO))
 
 
 
