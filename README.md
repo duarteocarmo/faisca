@@ -1,8 +1,8 @@
-![Logo](./readme/logo.png)
+# ⚡️🐐 Faísca - The modern LLM stack in 1000 lines of code
 
-# ⚡️ Faísca - The modern LLM stack in 1000 lines of code
+Faísca is a small uv script that implements the "modern" LLM stack in about 1000 lines of code in a single python file.
 
-Faísca is a small uv script that implements the "modern" LLM stack in about 1000 lines of code. It includes:
+It includes:
 
 - Complete GPT model implementation
 - Pre-training a GPT model from scratch

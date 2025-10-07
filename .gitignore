@@ -10,3 +10,4 @@ scripts/__pycache__
 output
 src/faisca/__pycache__
 charts
+__pycache__
