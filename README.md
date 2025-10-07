@@ -46,7 +46,7 @@ This code is meant to be changed and adapted. But the example uses a [dataset](h
 
 ### RL with GRPO
 
-![RL screenshot](./readme/faisca_2025-10-07_20-21-27_rl.png)
+![RL screenshot](./readme/faisca_2025-10-07_20-21-28_rl.png)
 
 ## TODO
 
