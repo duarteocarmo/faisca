@@ -1,10 +1,22 @@
+# /// script
+# requires-python = "==3.12.6"
+# dependencies = [
+#     "tiktoken",
+#     "torch",
+#     "matplotlib",
+#     "datasets",
+#     "numpy",
+# ]
+# ///
 import os
 import typing as t
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from datetime import datetime
+from typing import Optional, Self
 
 import matplotlib.pyplot as plt
+import random
 import tiktoken
 import torch
 import torch.optim as optim
@@ -12,7 +24,6 @@ from torch import nn
 from torch.nn import functional as F
 from torch.nn.utils import clip_grad_norm_
 from torch.utils.data import DataLoader, Dataset
-
 import datasets as hf_datasets
 
 
@@ -492,14 +503,103 @@ def save_plots_and_model(
 
 
 def calculate_reward_for(text: str) -> float:
-    return 1.0 if "!" in text else 0.0
+    target_words = [
+        "futebol",
+        "benfica",
+        "porto",
+        "sporting",
+        "bola",
+        "liga",
+        "campeão",
+        "taça",
+        "golo",
+        "jogo",
+        "jogador",
+        "treinador",
+        "fifa",
+        "uefa",
+        "euro",
+        "messi",
+        "ronaldo",
+    ]
+    has_word = set(text.lower().split()).intersection(set(target_words))
+    return 1.0 if has_word else 0.0
+
+
+@dataclass
+class Experience:
+    sequences: torch.Tensor
+    action_log_probs: torch.Tensor
+    log_probs_ref: torch.Tensor
+    returns: Optional[torch.Tensor]
+    advantages: Optional[torch.Tensor]
+    attention_mask: Optional[torch.Tensor]
+    action_mask: torch.Tensor
+    kl: Optional[torch.Tensor] = None
+
+    def to(self, device: torch.device) -> Self:
+        members = {}
+        for field in fields(self):
+            v = getattr(self, field.name)
+            if isinstance(v, torch.Tensor):
+                v = v.to(device=device)
+            members[field.name] = v
+        return Experience(**members)
+
+
+def split_experience_batch(experience: Experience) -> list[Experience]:
+    batch_size = experience.sequences.size(0)
+    batch_data = [{} for _ in range(batch_size)]
+    keys = (
+        "sequences",
+        "action_log_probs",
+        "log_probs_ref",
+        "returns",
+        "advantages",
+        "attention_mask",
+        "action_mask",
+    )
+    for key in keys:
+        value = getattr(experience, key)
+        if value is None:
+            vals = [None] * batch_size
+        else:
+            vals = torch.unbind(value)
+        assert batch_size == len(vals)
+        for i, v in enumerate(vals):
+            batch_data[i][key] = v
+
+    return [Experience(**data) for data in batch_data]
+
+
+class ReplayBuffer:
+    def __init__(self, limit: int = 0) -> None:
+        self.limit = limit
+        self.items: list[Experience] = []
+
+    def append(self, experience: Experience) -> None:
+        items = split_experience_batch(experience)
+        self.items.extend(items)
+        if self.limit > 0:
+            samples_to_remove = len(self.items) - self.limit
+            if samples_to_remove > 0:
+                self.items = self.items[samples_to_remove:]
+
+    def clear(self) -> None:
+        self.items.clear()
+
+    def __len__(self) -> int:
+        return len(self.items)
+
+    def __getitem__(self, idx: int) -> Experience:
+        return self.items[idx]
 
 
 def rollout(
     prompt: str,
     model: FaiscaGPT,
     tokenizer: tiktoken.Encoding,
-    config: Config,
+    config: dict,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[str]]:
     # Get token IDs
     eot_token_id = tokenizer.encode(
@@ -602,6 +702,16 @@ def zero_pad_sequences(
     return torch.stack(padded_sequences, dim=0)
 
 
+def masked_mean(
+    tensor: torch.Tensor,
+    mask: Optional[torch.Tensor],
+    dim: int = None,
+) -> torch.Tensor:
+    if mask is None:
+        return tensor.mean(axis=dim)
+    return (tensor * mask).sum(axis=dim) / mask.sum(axis=dim)
+
+
 class GRPOLoss(nn.Module):
     """GRPO actor loss"""
 
@@ -613,7 +723,7 @@ class GRPOLoss(nn.Module):
     def forward(
         self,
         log_probs: torch.Tensor,
-        experience: dict,
+        experience: Experience,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         old_log_probs = experience.action_log_probs
         log_probs_ref = experience.log_probs_ref
@@ -630,16 +740,12 @@ class GRPOLoss(nn.Module):
         surr1 = ratio * advantages
         surr2 = ratio.clamp(1 - self.clip_eps, 1 + self.clip_eps) * advantages
         loss = -torch.min(surr1, surr2) + self.kl_weight * kl
-
-        if action_mask is None:
-            loss = loss.mean(axis=1)
-        else:
-            loss = (loss * action_mask).sum(axis=1) / action_mask.sum(axis=1)
+        loss = masked_mean(loss, action_mask, dim=-1).mean()
 
         return loss, kl.mean()
 
 
-def join_experience_batch(items: list[dict]) -> dict:
+def join_experience_batch(items: list[Experience]) -> Experience:
     batch_data = {}
     keys = (
         "sequences",
@@ -651,13 +757,13 @@ def join_experience_batch(items: list[dict]) -> dict:
         "action_mask",
     )
     for key in keys:
-        vals = [item[key] for item in items]
+        vals = [getattr(item, key) for item in items]
         if all(v is not None for v in vals):
             data = zero_pad_sequences(vals, "left")
         else:
             data = None
         batch_data[key] = data
-    return batch_data
+    return Experience(**batch_data)
 
 
 def grpo(
@@ -668,8 +774,12 @@ def grpo(
     prompt = "Alerta "
     optimizer = optim.Adam(model.parameters(), lr=config["learning_rate"])
     objective = GRPOLoss(clip_eps=config["clip_eps"], kl_weight=config["kl_weight"])
+    cpu_device = torch.device("cpu")
 
     reference_model = deepcopy(model)
+
+    model.to(config["device"])
+    reference_model.to(config["device"])
 
     eot_token_id = tokenizer.encode(
         config["eot_token"], allowed_special={config["eot_token"]}
@@ -679,7 +789,7 @@ def grpo(
     step_kl_divergences = []
 
     for k in range(config["training_steps"]):
-        replay_buffer = []
+        replay_buffer = ReplayBuffer()
         rollout_returns = []
 
         with torch.no_grad():
@@ -696,7 +806,21 @@ def grpo(
             )
 
             print(f"Step {k} generated {len(rollout_completions)} completions")
-            print(f"Sample completions: {rollout_completions[:3]}")
+
+            sample_headlines = random.choices(
+                [
+                    headline
+                    for rc in rollout_completions
+                    for headline in rc.split(config["eot_token"])
+                ],
+                k=10,
+            )
+
+            print("=== Sample completions ===")
+            for sh in sample_headlines:
+                print(f"> {sh.strip()}")
+            print("=========================")
+
             print(f"Returns: {returns.sum().item():.2f}/{len(returns)}")
 
             advantages = (returns - returns.mean()) / (returns.std() + 1e-8)
@@ -721,20 +845,17 @@ def grpo(
                 action_mask=action_mask,
             )
 
-            print(f"KL: {kl.mean().item():.4f}")
-
-            replay_buffer.append(
-                {
-                    "sequences": sequence_ids,
-                    "action_log_probs": log_probs,
-                    "log_probs_ref": log_probs_reference,
-                    "returns": returns,
-                    "advantages": advantages,
-                    "attention_mask": attention_mask,
-                    "action_mask": action_mask,
-                    "kl": kl,
-                }
+            exp = Experience(
+                sequences=sequence_ids,
+                action_log_probs=log_probs,
+                log_probs_ref=log_probs_reference,
+                returns=returns,
+                advantages=advantages,
+                attention_mask=attention_mask,
+                action_mask=action_mask,
+                kl=kl,
             )
+            replay_buffer.append(exp.to(cpu_device))
 
         torch.mps.empty_cache()
         episode_return_sum = torch.stack(rollout_returns).sum()
@@ -755,14 +876,15 @@ def grpo(
         for step_epoch in range(config["epochs_per_step"]):
             model.train()
 
-            for exp in experience_sampler:
-                print(exp)
-
+            for index, exp in enumerate(experience_sampler):
+                print(f"Processing experience {index} of {len(experience_sampler)}")
+                exp: Experience
                 optimizer.zero_grad()
+                exp = exp.to(torch.device(config["device"]))
 
                 log_probs = sequences_log_probs(
                     model=model,
-                    sequence_ids=exp["sequences"],
+                    sequence_ids=exp.sequences,
                 )
 
                 loss, kl = objective(log_probs=log_probs, experience=exp)
@@ -784,9 +906,8 @@ def grpo(
             avg_kl = sum(step_kl_values) / len(step_kl_values)
             step_kl_divergences.append(avg_kl)
 
-        print("\nGenerating training plots...")
-
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8))
+    print("\nGenerating training plots...")
+    _, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8))
 
     # Plot rewards
     steps = list(range(len(step_rewards)))
@@ -838,6 +959,15 @@ if __name__ == "__main__":
     current_time = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     torch.manual_seed(42)
 
+    if not torch.backends.mps.is_available():
+        print(
+            "WARNING: MPS not available, you are probably running on CPU only - which is going to be very slow!"
+        )
+        print(
+            "I have not tested this code on CPU/CUDA, so you should probably expect some issues."
+        )
+        print("You have been warned :)")
+
     config = Config(
         batch_size=64,
         chart_path=f"charts/faisca_{current_time}.png",
@@ -850,11 +980,11 @@ if __name__ == "__main__":
         eval_text="Presidente",
         learning_rate=3e-4,
         max_length=256,
-        max_test_size=500,
-        max_train_size=5000,
+        max_test_size=6000,
+        max_train_size=30_000,
         train_language="pt",
         url_filter=None,
-        num_epochs=1,
+        num_epochs=10,
         num_workers=0,
         qkv_bias=False,
         save_path=f"models/faisca_{current_time}.pt",
@@ -876,7 +1006,6 @@ if __name__ == "__main__":
     model = FaiscaGPT(
         config=config,
     )
-
     print("\n========== PRE-TRAINING ==========")
 
     train_dataloader, val_dataloader = create_dataloaders(
@@ -908,10 +1037,10 @@ if __name__ == "__main__":
     sft_config = deepcopy(config)
     sft_config.url_filter = ".pt/"
     sft_config.save_path = f"models/faisca_{current_time}_sft.pt"
-    sft_config.num_epochs = 3
+    sft_config.num_epochs = 5
     sft_config.chart_path = f"charts/faisca_{current_time}_sft.png"
-    sft_config.max_train_size = 5_000
-    sft_config.max_test_size = 500
+    sft_config.max_train_size = 20_000
+    sft_config.max_test_size = 4000
     sft_config.eval_freq = 5
 
     sft_train_dataloader, sft_val_dataloader = create_dataloaders(
@@ -951,20 +1080,28 @@ if __name__ == "__main__":
 
     print("\n========== REINFORCEMENT LEARNING ==========")
 
+    # load model from file
+    # sft_model = FaiscaGPT(
+    #     config=sft_config,
+    # )
+    # sft_model.load_state_dict(
+    #     torch.load("models/faisca_2025-10-04_22-02-58_sft.pt", map_location="cpu")
+    # )
+
     rl_config = {
-        "num_rollouts": 8,
-        "max_new_tokens": 60,
-        "temperature": 1.0,
+        "num_rollouts": 24,
+        "max_new_tokens": 80,
+        "temperature": 0.8,
         "context_length": 128,
-        "top_k": 10,
+        "top_k": 30,
         "eot_token": "<|endoftext|>",
         "device": "mps",
-        "training_steps": 3,
-        "train_batch_size": 8,
-        "epochs_per_step": 1,
-        "learning_rate": 5e-6,
+        "training_steps": 18,
+        "train_batch_size": 12,
+        "epochs_per_step": 4,
+        "learning_rate": 1e-5,
         "clip_eps": 0.2,
-        "kl_weight": 0.01,
+        "kl_weight": 0.02,
         "max_norm": 1.0,
         "chart_path": f"charts/faisca_{current_time}_rl.png",
     }
