@@ -2,30 +2,38 @@
 # requires-python = "==3.12.6"
 # dependencies = [
 #     "tiktoken",
-#     "torch",
+#     "mlx",
 #     "matplotlib",
 #     "datasets",
-#     "numpy",
 # ]
 # ///
+import math
 import os
-from copy import deepcopy
 import pathlib
-import typing as t
-from dataclasses import dataclass, fields
-from datetime import datetime
-from typing import Optional, Self
-
-import matplotlib.pyplot as plt
 import random
-import tiktoken
-import torch
-import torch.optim as optim
-from torch import nn
-from torch.nn import functional as F
-from torch.nn.utils import clip_grad_norm_
-from torch.utils.data import DataLoader, Dataset
+import typing as t
+from contextlib import contextmanager
+from copy import deepcopy
+from dataclasses import dataclass
+from datetime import datetime
+
 import datasets as hf_datasets
+import matplotlib.pyplot as plt
+import mlx.core as mx
+import mlx.nn as nn
+import mlx.optimizers as optim
+from mlx.utils import tree_flatten, tree_map
+import tiktoken
+
+
+@contextmanager
+def using_training_mode(module: nn.Module, training: bool):
+    previous = module.training
+    module.train(training)
+    try:
+        yield
+    finally:
+        module.train(previous)
 
 
 @dataclass
@@ -65,16 +73,11 @@ class Config:
 
     def __post_init__(self):
         if self.device == "auto":
-            if torch.cuda.is_available():
-                self.device = "cuda"
-            elif torch.backends.mps.is_available():
-                self.device = "mps"
-            else:
-                self.device = "cpu"
-            print(f"Using device: {self.device}")
+            self.device = "mlx"
+        print("Using MLX with Apple Silicon acceleration")
 
 
-class CCTitleDataset(Dataset):
+class CCTitleDataset:
     def __init__(
         self,
         hf_split,
@@ -92,13 +95,18 @@ class CCTitleDataset(Dataset):
         self.stride = stride
         self.seed = seed
         self.vocab_size = tokenizer.n_vocab
-        self.EOT_TOKEN = "<|endoftext|>"
+        self.eot_token = "<|endoftext|>"
+
+        if max_size is not None:
+            sample_limit = min(len(hf_split), max_size * 20)
+            hf_split = hf_split.select(range(sample_limit))
 
         def process_row(row):
             title = (row.get("title") or "").strip()
             if language and row.get("language") != language:
                 return {"title": None}
-            if url_filter and url_filter not in row.get("requested_url"):
+            requested_url = row.get("requested_url") or ""
+            if url_filter and url_filter not in requested_url:
                 return {"title": None}
             return {"title": title if title else None}
 
@@ -106,19 +114,17 @@ class CCTitleDataset(Dataset):
 
         titles = [t for t in hf_split["title"] if t is not None]
 
-        # Apply size limit if specified
         if max_size is not None and len(titles) > max_size:
             titles = titles[:max_size]
 
         if shuffle_titles:
-            g = torch.Generator().manual_seed(seed)
-            perm = torch.randperm(len(titles), generator=g).tolist()
-            titles = [titles[i] for i in perm]
+            rng = random.Random(seed)
+            rng.shuffle(titles)
 
-        eot_id = tokenizer.encode(self.EOT_TOKEN, allowed_special={self.EOT_TOKEN})[0]
+        eot_id = tokenizer.encode(self.eot_token, allowed_special={self.eot_token})[0]
         ids: list[int] = []
         for doc in titles:
-            toks = tokenizer.encode(doc, allowed_special={self.EOT_TOKEN})
+            toks = tokenizer.encode(doc, allowed_special={self.eot_token})
             if toks:
                 ids.extend(toks)
                 ids.append(eot_id)
@@ -136,27 +142,68 @@ class CCTitleDataset(Dataset):
     def __len__(self) -> int:
         return len(self.inputs)
 
-    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
-        return torch.tensor(self.inputs[idx]), torch.tensor(self.targets[idx])
+    def __getitem__(self, idx: int) -> tuple[mx.array, mx.array]:
+        return (
+            mx.array(self.inputs[idx], dtype=mx.int32),
+            mx.array(self.targets[idx], dtype=mx.int32),
+        )
+
+
+class SimpleDataLoader:
+    def __init__(
+        self,
+        dataset: CCTitleDataset,
+        batch_size: int,
+        shuffle: bool,
+        drop_last: bool,
+        seed: int,
+    ):
+        self.dataset = dataset
+        self.batch_size = batch_size
+        self.shuffle = shuffle
+        self.drop_last = drop_last
+        self.seed = seed
+
+    def __len__(self) -> int:
+        if self.drop_last:
+            return len(self.dataset) // self.batch_size
+        return math.ceil(len(self.dataset) / self.batch_size)
+
+    def __iter__(self):
+        indices = list(range(len(self.dataset)))
+        if self.shuffle:
+            rng = random.Random(self.seed)
+            rng.shuffle(indices)
+            self.seed += 1
+
+        for start in range(0, len(indices), self.batch_size):
+            batch_indices = indices[start : start + self.batch_size]
+            if self.drop_last and len(batch_indices) < self.batch_size:
+                continue
+
+            inputs = [self.dataset[i][0] for i in batch_indices]
+            targets = [self.dataset[i][1] for i in batch_indices]
+
+            yield mx.stack(inputs), mx.stack(targets)
 
 
 class FeedForward(nn.Module):
     def __init__(self, embedding_dimension: int, hidden_expansion_factor: int = 4):
         super().__init__()
-        self.layers = nn.Sequential(
-            nn.Linear(
-                embedding_dimension,
-                hidden_expansion_factor * embedding_dimension,
-            ),
-            nn.GELU(),
-            nn.Linear(
-                hidden_expansion_factor * embedding_dimension,
-                embedding_dimension,
-            ),
+        self.linear1 = nn.Linear(
+            embedding_dimension,
+            hidden_expansion_factor * embedding_dimension,
+        )
+        self.linear2 = nn.Linear(
+            hidden_expansion_factor * embedding_dimension,
+            embedding_dimension,
         )
 
-    def forward(self, x):
-        return self.layers(x)
+    def __call__(self, x: mx.array) -> mx.array:
+        x = self.linear1(x)
+        x = nn.gelu(x)
+        x = self.linear2(x)
+        return x
 
 
 class TransformerBlock(nn.Module):
@@ -169,46 +216,41 @@ class TransformerBlock(nn.Module):
     ):
         super().__init__()
 
-        self.attention = nn.MultiheadAttention(
-            embed_dim=embedding_dimension,
+        self.attention = nn.MultiHeadAttention(
+            dims=embedding_dimension,
             num_heads=num_heads,
-            dropout=dropout_rate,
-            bias=qkv_bias,
-            batch_first=True,
         )
         self.feed_forward = FeedForward(
             embedding_dimension=embedding_dimension,
         )
         self.norm1 = nn.LayerNorm(embedding_dimension)
         self.norm2 = nn.LayerNorm(embedding_dimension)
-        self.drop_shortcut = nn.Dropout(p=dropout_rate)
+        self.dropout1 = nn.Dropout(p=dropout_rate)
+        self.dropout2 = nn.Dropout(p=dropout_rate)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def __call__(self, x: mx.array) -> mx.array:
         shortcut = x
         x = self.norm1(x)
 
-        L = x.size(1)
-        causal = torch.triu(torch.ones(L, L, dtype=torch.bool, device=x.device), 1)
-        x, _ = self.attention(x, x, x, attn_mask=causal)
-        x = self.drop_shortcut(x)
+        seq_len = x.shape[1]
+        mask = nn.MultiHeadAttention.create_additive_causal_mask(seq_len)
+        x = self.attention(x, x, x, mask=mask)
+        x = self.dropout1(x)
         x = x + shortcut
 
-        # shortcut connection // feed forward
         shortcut = x
         x = self.norm2(x)
         x = self.feed_forward(x)
-        x = self.drop_shortcut(x)
+        x = self.dropout2(x)
         x = x + shortcut
 
         return x
 
 
 class FaiscaGPT(nn.Module):
-    def __init__(
-        self,
-        config: Config,
-    ):
+    def __init__(self, config: Config):
         super().__init__()
+        self.config = config
         self.token_embedding = nn.Embedding(
             config.vocab_size, config.embedding_dimension
         )
@@ -216,37 +258,36 @@ class FaiscaGPT(nn.Module):
             config.context_length, config.embedding_dimension
         )
         self.dropout_embedding = nn.Dropout(p=config.dropout_rate)
-
-        self.transformer_blocks = nn.Sequential(
-            *[
-                TransformerBlock(
-                    embedding_dimension=config.embedding_dimension,
-                    num_heads=config.num_heads,
-                    qkv_bias=config.qkv_bias,
-                    dropout_rate=config.dropout_rate,
-                )
-                for _ in range(config.num_layers)
-            ]
-        )
-
+        self.transformer_blocks = [
+            TransformerBlock(
+                embedding_dimension=config.embedding_dimension,
+                num_heads=config.num_heads,
+                qkv_bias=config.qkv_bias,
+                dropout_rate=config.dropout_rate,
+            )
+            for _ in range(config.num_layers)
+        ]
         self.final_layer_norm = nn.LayerNorm(config.embedding_dimension)
         self.out_head = nn.Linear(
             config.embedding_dimension, config.vocab_size, bias=False
         )
 
-        n_params_all = sum(p.numel() for p in self.parameters())
+        mx.eval(self.parameters())
+        n_params_all = sum(value.size for _, value in tree_flatten(self.parameters()))
         n_params_all_million = n_params_all / 1e6
         print(f"Total number of params: {n_params_all_million:.2f}M")
 
-    def forward(self, in_idx: torch.Tensor) -> torch.Tensor:
+    def __call__(self, in_idx: mx.array) -> mx.array:
         _, sequence_length = in_idx.shape
         token_embeddings = self.token_embedding(in_idx)
         positional_embeddings = self.positional_embedding(
-            torch.arange(sequence_length, device=in_idx.device)
+            mx.arange(sequence_length, dtype=mx.int32)
         )
+        positional_embeddings = mx.expand_dims(positional_embeddings, axis=0)
         x = token_embeddings + positional_embeddings
         x = self.dropout_embedding(x)
-        x = self.transformer_blocks(x)
+        for block in self.transformer_blocks:
+            x = block(x)
         x = self.final_layer_norm(x)
         logits = self.out_head(x)
         return logits
@@ -256,8 +297,9 @@ def create_dataloaders(
     train_split,
     val_split,
     config: Config,
+    tokenizer: tiktoken.Encoding,
     seed: int = 1337,
-) -> tuple[DataLoader, DataLoader]:
+) -> tuple[SimpleDataLoader, SimpleDataLoader]:
     train_ds = CCTitleDataset(
         hf_split=train_split,
         tokenizer=tokenizer,
@@ -276,31 +318,33 @@ def create_dataloaders(
         stride=config.stride,
         language=config.train_language,
         url_filter=config.url_filter,
-        shuffle_titles=False,  # keep this deterministic
+        shuffle_titles=False,
         seed=seed,
         max_size=config.max_test_size,
     )
 
-    common = dict(
+    train_loader = SimpleDataLoader(
+        train_ds,
         batch_size=config.batch_size,
+        shuffle=config.dataloader_shuffle,
         drop_last=config.drop_last,
-        num_workers=config.num_workers,
-        pin_memory=True,
+        seed=seed,
     )
-    train_loader = DataLoader(train_ds, shuffle=config.dataloader_shuffle, **common)
-    val_loader = DataLoader(val_ds, shuffle=False, **common)
+    val_loader = SimpleDataLoader(
+        val_ds,
+        batch_size=config.batch_size,
+        shuffle=False,
+        drop_last=config.drop_last,
+        seed=seed,
+    )
     return train_loader, val_loader
 
 
-def calculate_loss(input_batch, target_batch, model, device):
-    input_batch, target_batch = (
-        input_batch.to(device),
-        target_batch.to(device),
-    )
+def calculate_loss(model: FaiscaGPT, input_batch: mx.array, target_batch: mx.array):
     logits = model(input_batch)
-    loss = torch.nn.functional.cross_entropy(
-        logits.flatten(0, 1), target_batch.flatten()
-    )
+    logits_flat = logits.reshape(-1, logits.shape[-1])
+    targets_flat = target_batch.reshape(-1)
+    loss = nn.losses.cross_entropy(logits_flat, targets_flat, reduction="mean")
     return loss
 
 
@@ -309,18 +353,12 @@ def generate_samples(
     tokenizer: tiktoken.Encoding,
     config: Config,
 ) -> None:
-    model.eval()
+    encoded_prompt = tokenizer.encode(
+        config.eval_text, allowed_special={config.eot_token}
+    )
+    encoded = mx.array(encoded_prompt, dtype=mx.int32).reshape(1, -1)
 
-    with torch.no_grad():
-        encoded = (
-            torch.tensor(
-                tokenizer.encode(config.eval_text, allowed_special={config.eot_token}),
-                dtype=torch.long,
-            )
-            .unsqueeze(0)
-            .to(config.device)
-        )
-
+    with using_training_mode(model, False):
         for gen_num in range(config.eval_num_samples):
             encoded_completion = generate_single_sample(
                 model=model,
@@ -333,130 +371,129 @@ def generate_samples(
 
             decoded = tokenizer.decode(encoded_completion[0].tolist())
             decoded = decoded.replace("\n", " ").strip()
-            instances = decoded.split(config.eot_token)  # split at eot token
+            instances = decoded.split(config.eot_token)
 
             print(f"**** GENERATION {gen_num + 1} OF {config.eval_num_samples} ****")
             for instance in instances:
-                print(f"> '{instance}'")
+                print(f"> '{instance.strip()}'")
             print("*" * 25)
 
 
 def generate_single_sample(
     model: FaiscaGPT,
-    encoded: torch.Tensor,
+    encoded: mx.array,
     max_new_tokens: int,
     temperature: float,
     context_length: int,
     top_k: int,
     stop_at_eot: int | None = None,
-) -> torch.Tensor:
+) -> mx.array:
+    generated = encoded
     for _ in range(max_new_tokens):
-        idx_cond = encoded[:, -context_length:]
+        idx_cond = generated[:, -context_length:]
 
         logits = model(idx_cond)
         logits = logits[:, -1, :] / temperature
 
-        v, _ = torch.topk(logits, top_k)
-        logits[logits < v[:, [-1]]] = -float("Inf")
+        top_values = mx.topk(logits, top_k)
+        thresholds = top_values[:, [-1]]
+        logits = mx.where(logits < thresholds, -mx.inf, logits)
 
-        probs = torch.nn.functional.softmax(logits, dim=-1)
-        idx_next = torch.multinomial(probs, num_samples=1)
+        probs = mx.softmax(logits, axis=-1)
+        idx_next = mx.random.categorical(probs, num_samples=1)
+        idx_next = idx_next.astype(mx.int32)
 
-        encoded = torch.cat((encoded, idx_next), dim=1)
-        if stop_at_eot is not None and idx_next.item() == stop_at_eot:
+        generated = mx.concatenate([generated, idx_next], axis=1)
+
+        if stop_at_eot is not None and int(idx_next[0, 0].item()) == stop_at_eot:
             break
 
-    return encoded
+    return generated
 
 
 def train(
     model: FaiscaGPT,
     config: Config,
-    train_dataloader: DataLoader,
-    val_dataloader: DataLoader,
+    train_dataloader: SimpleDataLoader,
+    val_dataloader: SimpleDataLoader,
     tokenizer: tiktoken.Encoding,
 ):
-    training_losses, validation_losses, track_tokens_seen = [], [], []
+    training_losses: list[float] = []
+    validation_losses: list[float] = []
+    track_tokens_seen: list[int] = []
     tokens_seen = 0
     global_step = -1
 
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=config.learning_rate,
+    optimizer = optim.AdamW(
+        learning_rate=config.learning_rate,
         weight_decay=config.weight_decay,
     )
 
-    model.to(config.device)
+    def loss_fn(model: FaiscaGPT, input_batch: mx.array, target_batch: mx.array):
+        return calculate_loss(model, input_batch, target_batch)
+
+    loss_and_grad_fn = nn.value_and_grad(model, loss_fn)
 
     for epoch in range(config.num_epochs):
-        model.train()
+        model.train(True)
         size_train_dataloader = len(train_dataloader)
         batch_num = 0
 
         for input_batch, target_batch in train_dataloader:
-            optimizer.zero_grad()
-            loss = calculate_loss(
-                input_batch=input_batch,
-                target_batch=target_batch,
-                model=model,
-                device=config.device,
-            )
-            loss.backward()
-            optimizer.step()
-            tokens_seen += input_batch.numel()
+            loss_value, grads = loss_and_grad_fn(model, input_batch, target_batch)
+            optimizer.update(model, grads)
+            mx.eval(model.parameters(), optimizer.state)
+
+            tokens_seen += int(input_batch.size)
             global_step += 1
             batch_num += 1
 
-            # run evaluation
             if global_step % config.eval_freq == 0:
-                model.eval()
-                with torch.no_grad():
-                    losses = dict()
-                    for split, dataloader in [
-                        ("train", train_dataloader),
-                        ("validation", val_dataloader),
-                    ]:
-                        total_split_loss = 0
-                        for i, (input_batch, target_batch) in enumerate(dataloader):
-                            if i < config.eval_iter:
-                                loss = calculate_loss(
-                                    input_batch=input_batch,
-                                    target_batch=target_batch,
-                                    model=model,
-                                    device=config.device,
-                                )
-                                total_split_loss += loss.item()
-                            else:
-                                break
+                model.train(False)
+                losses: dict[str, float] = {}
+                for split, dataloader in [
+                    ("train", train_dataloader),
+                    ("validation", val_dataloader),
+                ]:
+                    total_split_loss = 0.0
+                    eval_batches = 0
+                    for i, (eval_input, eval_target) in enumerate(dataloader):
+                        if i < config.eval_iter:
+                            loss_eval = calculate_loss(model, eval_input, eval_target)
+                            total_split_loss += float(loss_eval.item())
+                            eval_batches += 1
+                        else:
+                            break
 
-                        losses[split] = total_split_loss / config.eval_iter
+                    if eval_batches == 0:
+                        losses[split] = 0.0
+                    else:
+                        losses[split] = total_split_loss / eval_batches
 
-                    train_loss = losses["train"]
-                    validation_loss = losses["validation"]
+                train_loss = losses["train"]
+                validation_loss = losses["validation"]
 
-                    print(
-                        (
-                            f"Epoch: {epoch} - Step: {global_step} - "
-                            f"Train Loss: {train_loss:.4f} - "
-                            f"Validation Loss: {validation_loss:.4f} - "
-                            f"Batch: {batch_num} / {size_train_dataloader} - "
-                            f"Tokens seen: {tokens_seen}"
-                        )
+                print(
+                    (
+                        f"Epoch: {epoch} - Step: {global_step} - "
+                        f"Train Loss: {train_loss:.4f} - "
+                        f"Validation Loss: {validation_loss:.4f} - "
+                        f"Batch: {batch_num} / {size_train_dataloader} - "
+                        f"Tokens seen: {tokens_seen}"
                     )
+                )
 
-                    training_losses.append(train_loss)
-                    validation_losses.append(validation_loss)
-                    track_tokens_seen.append(tokens_seen)
+                training_losses.append(train_loss)
+                validation_losses.append(validation_loss)
+                track_tokens_seen.append(tokens_seen)
 
-                    model.train()
+                model.train(True)
 
         generate_samples(
             model=model,
             tokenizer=tokenizer,
             config=config,
         )
-
-        model.train()
 
     return model, training_losses, validation_losses, track_tokens_seen
 
@@ -465,32 +502,31 @@ def save_plots_and_model(
     config: Config,
     training_losses: list[float],
     validation_losses: list[float],
-    track_tokens_seen: list[float],
+    track_tokens_seen: list[int],
     model: FaiscaGPT,
 ):
     fig, ax1 = plt.subplots()
 
-    epochs_tensor = torch.linspace(0, config.num_epochs, len(training_losses))
-    # Plot training and validation loss against epochs
-    ax1.plot(epochs_tensor, training_losses, label="Training loss")
-    ax1.plot(
-        epochs_tensor,
-        validation_losses,
-        linestyle="-.",
-        label="Validation loss",
-    )
+    if training_losses:
+        epochs_array = mx.linspace(0, config.num_epochs, len(training_losses)).tolist()
+        ax1.plot(epochs_array, training_losses, label="Training loss")
+        ax1.plot(
+            epochs_array,
+            validation_losses,
+            linestyle="-.",
+            label="Validation loss",
+        )
+        ax2 = ax1.twiny()
+        ax2.plot(track_tokens_seen, training_losses, alpha=0)
+        ax2.set_xlabel("Tokens seen")
+        ax1.legend(loc="upper right")
+    else:
+        ax1.plot([], [])
+        ax2 = ax1.twiny()
     ax1.set_xlabel("Epochs")
     ax1.set_ylabel("Loss")
-    ax1.legend(loc="upper right")
 
-    # Create a second x-axis for tokens seen
-    ax2 = ax1.twiny()  # Create a second x-axis that shares the same y-axis
-    ax2.plot(
-        track_tokens_seen, training_losses, alpha=0
-    )  # Invisible plot for aligning ticks
-    ax2.set_xlabel("Tokens seen")
-
-    fig.tight_layout()  # Adjust layout to make room
+    fig.tight_layout()
 
     if not os.path.exists(os.path.dirname(config.chart_path)):
         os.makedirs(os.path.dirname(config.chart_path))
@@ -499,7 +535,9 @@ def save_plots_and_model(
 
     if not os.path.exists(os.path.dirname(config.save_path)):
         os.makedirs(os.path.dirname(config.save_path))
-    torch.save(model.state_dict(), config.save_path)
+
+    params = {name: value for name, value in tree_flatten(model.parameters())}
+    mx.savez(config.save_path, **params)
     print(f"Model saved to {config.save_path}")
 
 
@@ -529,28 +567,19 @@ def calculate_reward_for(text: str) -> float:
 
 @dataclass
 class Experience:
-    sequences: torch.Tensor
-    action_log_probs: torch.Tensor
-    log_probs_ref: torch.Tensor
-    returns: Optional[torch.Tensor]
-    advantages: Optional[torch.Tensor]
-    attention_mask: Optional[torch.Tensor]
-    action_mask: torch.Tensor
-    kl: Optional[torch.Tensor] = None
-
-    def to(self, device: torch.device) -> Self:
-        members = {}
-        for field in fields(self):
-            v = getattr(self, field.name)
-            if isinstance(v, torch.Tensor):
-                v = v.to(device=device)
-            members[field.name] = v
-        return Experience(**members)
+    sequences: mx.array
+    action_log_probs: mx.array
+    log_probs_ref: mx.array
+    returns: mx.array | None
+    advantages: mx.array | None
+    attention_mask: mx.array | None
+    action_mask: mx.array
+    kl: mx.array | None = None
 
 
 def split_experience_batch(experience: Experience) -> list[Experience]:
-    batch_size = experience.sequences.size(0)
-    batch_data = [{} for _ in range(batch_size)]
+    batch_size = experience.sequences.shape[0]
+    batch_items = []
     keys = (
         "sequences",
         "action_log_probs",
@@ -559,18 +588,15 @@ def split_experience_batch(experience: Experience) -> list[Experience]:
         "advantages",
         "attention_mask",
         "action_mask",
+        "kl",
     )
-    for key in keys:
-        value = getattr(experience, key)
-        if value is None:
-            vals = [None] * batch_size
-        else:
-            vals = torch.unbind(value)
-        assert batch_size == len(vals)
-        for i, v in enumerate(vals):
-            batch_data[i][key] = v
-
-    return [Experience(**data) for data in batch_data]
+    for i in range(batch_size):
+        data = {}
+        for key in keys:
+            value = getattr(experience, key)
+            data[key] = value[i] if value is not None else None
+        batch_items.append(Experience(**data))
+    return batch_items
 
 
 class ReplayBuffer:
@@ -601,131 +627,115 @@ def rollout(
     model: FaiscaGPT,
     tokenizer: tiktoken.Encoding,
     config: dict,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[str]]:
-    # Get token IDs
+) -> tuple[mx.array, mx.array, mx.array, list[str]]:
     eot_token_id = tokenizer.encode(
         config["eot_token"], allowed_special={config["eot_token"]}
     )[0]
 
-    # Encode prompt and create tensors
-    input_ids = tokenizer.encode(prompt, allowed_special={config["eot_token"]})
-    input_ids = torch.tensor([input_ids], dtype=torch.long)
-    attention_mask = torch.ones_like(input_ids)
+    prompt_ids = tokenizer.encode(prompt, allowed_special={config["eot_token"]})
+    if not prompt_ids:
+        prompt_ids = [eot_token_id]
 
-    # Repeat for multiple rollouts
-    attention_mask = attention_mask.repeat(config["num_rollouts"], 1)
-    input_ids = input_ids.repeat(config["num_rollouts"], 1)
+    repeated_ids = [prompt_ids for _ in range(config["num_rollouts"])]
+    input_ids = mx.array(repeated_ids, dtype=mx.int32)
 
-    input_ids = input_ids.to(config["device"])
-    attention_mask = attention_mask.to(config["device"])
+    with using_training_mode(model, False):
+        sequence_ids = generate_single_sample(
+            model=model,
+            encoded=input_ids,
+            max_new_tokens=config["max_new_tokens"],
+            temperature=config["temperature"],
+            context_length=config["context_length"],
+            top_k=config["top_k"],
+        )
 
-    # Generate sequences
-    model.eval()
-    sequence_ids = generate_single_sample(
-        model=model,
-        encoded=input_ids,
-        max_new_tokens=config["max_new_tokens"],
-        temperature=config["temperature"],
-        context_length=config["context_length"],
-        top_k=config["top_k"],
-    )
+    completions = [
+        tokenizer.decode(sequence_ids[i].tolist()) for i in range(sequence_ids.shape[0])
+    ]
 
-    # Decode all completions
-    completions = []
-    for i in range(sequence_ids.size(0)):
-        completion = tokenizer.decode(sequence_ids[i].tolist())
-        completions.append(completion)
-
-    # Create action mask
-    action_mask = torch.zeros_like(sequence_ids, dtype=torch.bool)
-    action_mask[:, input_ids.shape[1] :] = True
-    action_mask[sequence_ids == eot_token_id] = False
+    seq_len = sequence_ids.shape[1]
+    positions = mx.arange(seq_len, dtype=mx.int32)
+    positions = mx.broadcast_to(positions, sequence_ids.shape)
+    prompt_length = len(prompt_ids)
+    action_mask = positions >= prompt_length
+    action_mask = mx.logical_and(action_mask, mx.not_equal(sequence_ids, eot_token_id))
     action_mask = action_mask[:, 1:]
 
-    # Calculate rewards
-    returns = torch.zeros(config["num_rollouts"], 1, dtype=torch.float)
-    for i, completion in enumerate(completions):
-        reward = calculate_reward_for(completion)
-        returns[i] = reward
+    returns_values = [calculate_reward_for(text) for text in completions]
+    returns = mx.array(returns_values, dtype=mx.float32).reshape(-1, 1)
 
     return sequence_ids, returns, action_mask, completions
 
 
 def approx_kl_divergence(
-    log_probs: torch.Tensor,
-    log_probs_ref: torch.Tensor,
-    action_mask: t.Optional[torch.Tensor],
-) -> torch.Tensor:
-    """
-    Monte-Carlo approximation of KL divergence, k3 estimator, see: http://joschu.net/blog/kl-approx.html
-    """
-
-    log_ratio = log_probs_ref.float() - log_probs.float()
+    log_probs: mx.array,
+    log_probs_ref: mx.array,
+    action_mask: t.Optional[mx.array],
+) -> mx.array:
+    log_ratio = log_probs_ref.astype(mx.float32) - log_probs.astype(mx.float32)
     if action_mask is not None:
-        log_ratio = log_ratio * action_mask
-
-    return log_ratio.exp() - log_ratio - 1
+        log_ratio = log_ratio * action_mask.astype(log_ratio.dtype)
+    return mx.exp(log_ratio) - log_ratio - 1
 
 
 def sequences_log_probs(
     model: FaiscaGPT,
-    sequence_ids: torch.Tensor,
-) -> torch.Tensor:
-    # Get logits from model
-    logits = model(sequence_ids)  # (batch_size, seq_len, vocab_size)
-
-    # Calculate log probabilities
-    log_probs = F.log_softmax(logits, dim=-1)  # (batch_size, seq_len, vocab_size)
-
-    # Get log probabilities for the actual tokens
-    # We shift by 1 because we want log prob of next token
-    target_ids = sequence_ids[:, 1:]  # (batch_size, seq_len-1)
-    log_probs = log_probs[:, :-1, :]  # (batch_size, seq_len-1, vocab_size)
-
-    # Gather log probabilities for the target tokens
-    log_probs = log_probs.gather(dim=-1, index=target_ids.unsqueeze(-1)).squeeze(
-        -1
-    )  # (batch_size, seq_len-1)
-
-    return log_probs
+    sequence_ids: mx.array,
+) -> mx.array:
+    with using_training_mode(model, False):
+        logits = model(sequence_ids)
+    log_probs = nn.log_softmax(logits, axis=-1)
+    target_ids = sequence_ids[:, 1:]
+    log_probs = log_probs[:, :-1, :]
+    gathered = mx.take_along_axis(
+        log_probs, mx.expand_dims(target_ids, axis=-1), axis=-1
+    )
+    return mx.squeeze(gathered, axis=-1)
 
 
-def zero_pad_sequences(
-    sequences: list[torch.Tensor], side: str = "left"
-) -> torch.Tensor:
+def zero_pad_sequences(sequences: list[mx.array], side: str = "left") -> mx.array:
     assert side in ("left", "right")
-    max_len = max(seq.size(0) for seq in sequences)
+    if not sequences:
+        raise ValueError("Expected non-empty sequence list")
+    max_len = max(seq.shape[0] for seq in sequences)
+    dtype = sequences[0].dtype
     padded_sequences = []
+    fill_value = False if dtype == mx.bool_ else 0
     for seq in sequences:
-        pad_len = max_len - seq.size(0)
-        padding = (pad_len, 0) if side == "left" else (0, pad_len)
-        padded_sequences.append(F.pad(seq, padding))
-    return torch.stack(padded_sequences, dim=0)
+        pad_len = max_len - seq.shape[0]
+        pad_width = [(0, 0)] * seq.ndim
+        if seq.ndim == 0:
+            pad_width = [(pad_len, 0)]
+        else:
+            pad_width[0] = (pad_len, 0) if side == "left" else (0, pad_len)
+        padded = mx.pad(seq, pad_width, constant_values=fill_value)
+        padded_sequences.append(padded)
+    return mx.stack(padded_sequences, axis=0)
 
 
 def masked_mean(
-    tensor: torch.Tensor,
-    mask: Optional[torch.Tensor],
-    dim: int = None,
-) -> torch.Tensor:
+    tensor: mx.array,
+    mask: t.Optional[mx.array],
+    axis: int | None = None,
+) -> mx.array:
     if mask is None:
-        return tensor.mean(axis=dim)
-    return (tensor * mask).sum(axis=dim) / mask.sum(axis=dim)
+        return mx.mean(tensor, axis=axis)
+    mask = mask.astype(tensor.dtype)
+    numerator = mx.sum(tensor * mask, axis=axis)
+    denominator = mx.sum(mask, axis=axis) + 1e-8
+    return numerator / denominator
 
 
-class GRPOLoss(nn.Module):
-    """GRPO actor loss"""
-
+class GRPOLoss:
     def __init__(self, clip_eps: float, kl_weight: float) -> None:
-        super().__init__()
         self.clip_eps = clip_eps
         self.kl_weight = kl_weight
 
-    def forward(
+    def __call__(
         self,
-        log_probs: torch.Tensor,
+        log_probs: mx.array,
         experience: Experience,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[mx.array, mx.array]:
         old_log_probs = experience.action_log_probs
         log_probs_ref = experience.log_probs_ref
         action_mask = experience.action_mask
@@ -737,13 +747,14 @@ class GRPOLoss(nn.Module):
             action_mask=action_mask,
         )
 
-        ratio = (log_probs - old_log_probs).exp()
+        ratio = mx.exp(log_probs - old_log_probs)
         surr1 = ratio * advantages
-        surr2 = ratio.clamp(1 - self.clip_eps, 1 + self.clip_eps) * advantages
-        loss = -torch.min(surr1, surr2) + self.kl_weight * kl
-        loss = masked_mean(loss, action_mask, dim=-1).mean()
+        surr2 = mx.clip(ratio, 1 - self.clip_eps, 1 + self.clip_eps) * advantages
+        loss = -mx.minimum(surr1, surr2) + self.kl_weight * kl
+        loss = masked_mean(loss, action_mask, axis=-1)
+        loss = mx.mean(loss)
 
-        return loss, kl.mean()
+        return loss, mx.mean(kl)
 
 
 def join_experience_batch(items: list[Experience]) -> Experience:
@@ -756,15 +767,67 @@ def join_experience_batch(items: list[Experience]) -> Experience:
         "advantages",
         "attention_mask",
         "action_mask",
+        "kl",
     )
     for key in keys:
         vals = [getattr(item, key) for item in items]
         if all(v is not None for v in vals):
-            data = zero_pad_sequences(vals, "left")
+            batch_data[key] = zero_pad_sequences(vals, "left")
         else:
-            data = None
-        batch_data[key] = data
+            batch_data[key] = None
     return Experience(**batch_data)
+
+
+class ExperienceSampler:
+    def __init__(
+        self,
+        replay_buffer: ReplayBuffer,
+        batch_size: int,
+        shuffle: bool,
+        drop_last: bool,
+        seed: int = 0,
+    ):
+        self.replay_buffer = replay_buffer
+        self.batch_size = batch_size
+        self.shuffle = shuffle
+        self.drop_last = drop_last
+        self.seed = seed
+
+    def __len__(self) -> int:
+        if self.drop_last:
+            return len(self.replay_buffer) // self.batch_size
+        return math.ceil(len(self.replay_buffer) / self.batch_size)
+
+    def __iter__(self):
+        indices = list(range(len(self.replay_buffer)))
+        if self.shuffle:
+            rng = random.Random(self.seed)
+            rng.shuffle(indices)
+            self.seed += 1
+
+        for start in range(0, len(indices), self.batch_size):
+            batch_indices = indices[start : start + self.batch_size]
+            if self.drop_last and len(batch_indices) < self.batch_size:
+                continue
+            batch_items = [self.replay_buffer[idx] for idx in batch_indices]
+            yield join_experience_batch(batch_items)
+
+
+def clip_gradients(grads: dict, max_norm: float) -> tuple[dict, float]:
+    leaves = tree_flatten(grads)
+    total = 0.0
+    for _, grad in leaves:
+        if grad is None:
+            continue
+        total += float(mx.sum(grad * grad).item())
+    total_norm = math.sqrt(total)
+    if total_norm > max_norm and total_norm > 0:
+        scale = max_norm / (total_norm + 1e-6)
+        grads = tree_map(
+            lambda g: g * scale if isinstance(g, mx.array) else g,
+            grads,
+        )
+    return grads, total_norm
 
 
 def grpo(
@@ -773,135 +836,130 @@ def grpo(
     tokenizer: tiktoken.Encoding,
 ):
     prompt = "Alerta "
-    optimizer = optim.Adam(model.parameters(), lr=config["learning_rate"])
+    optimizer = optim.Adam(learning_rate=config["learning_rate"])
     objective = GRPOLoss(clip_eps=config["clip_eps"], kl_weight=config["kl_weight"])
-    cpu_device = torch.device("cpu")
 
     reference_model = deepcopy(model)
-
-    model.to(config["device"])
-    reference_model.to(config["device"])
+    mx.eval(reference_model.parameters())
 
     eot_token_id = tokenizer.encode(
         config["eot_token"], allowed_special={config["eot_token"]}
     )[0]
 
-    step_rewards = []
-    step_kl_divergences = []
+    step_rewards: list[float] = []
+    step_kl_divergences: list[float] = []
+
+    def loss_fn(model: FaiscaGPT, exp_batch: Experience):
+        log_probs = sequences_log_probs(model=model, sequence_ids=exp_batch.sequences)
+        loss, _ = objective(log_probs, exp_batch)
+        return loss
+
+    loss_and_grad_fn = nn.value_and_grad(model, loss_fn)
 
     for k in range(config["training_steps"]):
         replay_buffer = ReplayBuffer()
-        rollout_returns = []
+        rollout_returns: list[mx.array] = []
 
-        with torch.no_grad():
-            (
-                sequence_ids,
-                returns,
-                action_mask,
-                rollout_completions,
-            ) = rollout(
-                prompt=prompt,
-                model=model,
-                tokenizer=tokenizer,
-                config=config,
-            )
+        (
+            sequence_ids,
+            returns,
+            action_mask,
+            rollout_completions,
+        ) = rollout(
+            prompt=prompt,
+            model=model,
+            tokenizer=tokenizer,
+            config=config,
+        )
 
-            print(f"Step {k} generated {len(rollout_completions)} completions")
+        print(f"Step {k} generated {len(rollout_completions)} completions")
 
-            sample_headlines = random.choices(
-                [
-                    headline
-                    for rc in rollout_completions
-                    for headline in rc.split(config["eot_token"])
-                ],
-                k=10,
-            )
+        sample_headlines = random.choices(
+            [
+                headline
+                for rc in rollout_completions
+                for headline in rc.split(config["eot_token"])
+            ],
+            k=min(10, len(rollout_completions)),
+        )
 
-            print("=== Sample completions ===")
-            for sh in sample_headlines:
-                print(f"> {sh.strip()}")
-            print("=========================")
+        print("=== Sample completions ===")
+        for sh in sample_headlines:
+            print(f"> {sh.strip()}")
+        print("=========================")
 
-            print(f"Returns: {returns.sum().item():.2f}/{len(returns)}")
+        print(f"Returns: {float(mx.sum(returns).item()):.2f}/{returns.shape[0]}")
 
-            advantages = (returns - returns.mean()) / (returns.std() + 1e-8)
-            attention_mask = sequence_ids != eot_token_id
-            rollout_returns.append(returns.cpu())
+        returns_mean = mx.mean(returns)
+        returns_std = mx.std(returns)
+        advantages = (returns - returns_mean) / (returns_std + 1e-8)
+        attention_mask = mx.not_equal(sequence_ids, eot_token_id)
+        rollout_returns.append(returns)
 
-            # TODO: Check if this needs
-            # attention mask or if we are ok
-            log_probs = sequences_log_probs(
-                model=model,
-                sequence_ids=sequence_ids,
-            )
+        log_probs = sequences_log_probs(
+            model=model,
+            sequence_ids=sequence_ids,
+        )
 
-            log_probs_reference = sequences_log_probs(
-                model=reference_model,
-                sequence_ids=sequence_ids,
-            )
+        log_probs_reference = sequences_log_probs(
+            model=reference_model,
+            sequence_ids=sequence_ids,
+        )
 
-            kl = approx_kl_divergence(
-                log_probs=log_probs,
-                log_probs_ref=log_probs_reference,
-                action_mask=action_mask,
-            )
+        kl = approx_kl_divergence(
+            log_probs=log_probs,
+            log_probs_ref=log_probs_reference,
+            action_mask=action_mask,
+        )
 
-            exp = Experience(
-                sequences=sequence_ids,
-                action_log_probs=log_probs,
-                log_probs_ref=log_probs_reference,
-                returns=returns,
-                advantages=advantages,
-                attention_mask=attention_mask,
-                action_mask=action_mask,
-                kl=kl,
-            )
-            replay_buffer.append(exp.to(cpu_device))
+        exp = Experience(
+            sequences=sequence_ids,
+            action_log_probs=log_probs,
+            log_probs_ref=log_probs_reference,
+            returns=returns,
+            advantages=advantages,
+            attention_mask=attention_mask,
+            action_mask=action_mask,
+            kl=kl,
+        )
+        replay_buffer.append(exp)
 
-        torch.mps.empty_cache()
-        episode_return_sum = torch.stack(rollout_returns).sum()
+        episode_return_sum = float(mx.sum(mx.stack(rollout_returns)).item())
         print(f"Returns of step {k}: {episode_return_sum:.4f}")
 
-        step_rewards.append(episode_return_sum.item())
+        step_rewards.append(episode_return_sum)
 
-        experience_sampler = DataLoader(
+        experience_sampler = ExperienceSampler(
             replay_buffer,
             batch_size=config["train_batch_size"],
             shuffle=True,
             drop_last=True,
-            collate_fn=join_experience_batch,
+            seed=k,
         )
 
-        step_kl_values = []
+        step_kl_values: list[float] = []
 
         for step_epoch in range(config["epochs_per_step"]):
-            model.train()
-
-            for index, exp in enumerate(experience_sampler):
+            for index, exp_batch in enumerate(experience_sampler):
                 print(f"Processing experience {index} of {len(experience_sampler)}")
-                exp: Experience
-                optimizer.zero_grad()
-                exp = exp.to(torch.device(config["device"]))
+                loss_value, grads = loss_and_grad_fn(model, exp_batch)
 
-                log_probs = sequences_log_probs(
+                grads, grad_norm = clip_gradients(grads, config["max_norm"])
+                optimizer.update(model, grads)
+                mx.eval(model.parameters(), optimizer.state)
+
+                log_probs_updated = sequences_log_probs(
                     model=model,
-                    sequence_ids=exp.sequences,
+                    sequence_ids=exp_batch.sequences,
+                )
+                _, kl_value = objective(log_probs_updated, exp_batch)
+
+                print(
+                    f"{step_epoch}: kl={float(kl_value.item()): .4f}, "
+                    f"grad_norm={grad_norm: .4f}, loss={float(loss_value.item()): .4f}"
                 )
 
-                loss, kl = objective(log_probs=log_probs, experience=exp)
-
-                if not loss.isfinite():
-                    print(f"Loss not finite, skipping backward, loss={loss}")
-                    continue
-
-                loss.backward()
-                grad_norm = clip_grad_norm_(
-                    model.parameters(), max_norm=config["max_norm"]
-                )
-                print(f"{step_epoch}: kl={kl: .4f}, grad_norm={grad_norm: .4f}")
-
-                optimizer.step()
-                step_kl_values.append(kl.item())
+                step_kl_values.append(float(kl_value.item()))
 
         if step_kl_values:
             avg_kl = sum(step_kl_values) / len(step_kl_values)
@@ -910,7 +968,6 @@ def grpo(
     print("\nGenerating training plots...")
     _, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8))
 
-    # Plot rewards
     steps = list(range(len(step_rewards)))
     ax1.plot(steps, step_rewards, "b-", linewidth=2, marker="o", markersize=4)
     ax1.set_xlabel("Training Step")
@@ -919,7 +976,6 @@ def grpo(
     ax1.grid(True, alpha=0.3)
     ax1.set_ylim(bottom=0)
 
-    # Plot KL divergence
     if step_kl_divergences:
         kl_steps = list(range(len(step_kl_divergences)))
         ax2.plot(
@@ -935,19 +991,25 @@ def grpo(
         ax2.set_title("KL Divergence Over Time")
         ax2.grid(True, alpha=0.3)
         ax2.set_ylim(bottom=0)
+    else:
+        ax2.plot([], [])
+        ax2.set_title("KL Divergence Over Time")
 
     plt.tight_layout()
     plt.savefig(config["chart_path"], dpi=300, bbox_inches="tight")
     plt.close()
 
     print("Training completed! Final metrics:")
-    print(f"  - Final reward: {step_rewards[-1]:.2f}")
     print(
-        f"  - Final KL divergence: {step_kl_divergences[-1]:.4f}"
-        if step_kl_divergences
-        else "  - No KL divergence data"
+        f"  - Final reward: {step_rewards[-1]:.2f}"
+        if step_rewards
+        else "  - No reward data"
     )
-    print("  - Training plots saved to: training_metrics.png")
+    if step_kl_divergences:
+        print(f"  - Final KL divergence: {step_kl_divergences[-1]:.4f}")
+    else:
+        print("  - No KL divergence data")
+    print(f"  - Training plots saved to: {config['chart_path']}")
 
     return model, step_rewards, step_kl_divergences
 
@@ -958,16 +1020,7 @@ if __name__ == "__main__":
     ds_train, ds_val = ds["train"], ds["test"]
 
     current_time = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    torch.manual_seed(42)
-
-    if not torch.backends.mps.is_available():
-        print(
-            "WARNING: MPS not available, you are probably running on CPU only - which is going to be very slow!"
-        )
-        print(
-            "I have not tested this code on CPU/CUDA, so you should probably expect some issues."
-        )
-        print("You have been warned :)")
+    mx.random.seed(42)
 
     if not pathlib.Path("models").exists():
         print("Creating models/ directory")
@@ -995,7 +1048,7 @@ if __name__ == "__main__":
         num_epochs=1,
         num_workers=0,
         qkv_bias=False,
-        save_path=f"models/faisca_{current_time}.pt",
+        save_path=f"models/faisca_{current_time}.npz",
         stride=64,
         vocab_size=tokenizer.n_vocab,
         weight_decay=0.1,
@@ -1020,6 +1073,7 @@ if __name__ == "__main__":
         train_split=ds_train,
         val_split=ds_val,
         config=config,
+        tokenizer=tokenizer,
     )
 
     model, training_losses, validation_losses, track_tokens_seen = train(
@@ -1044,7 +1098,7 @@ if __name__ == "__main__":
 
     sft_config = deepcopy(config)
     sft_config.url_filter = ".pt/"
-    sft_config.save_path = f"models/faisca_{current_time}_sft.pt"
+    sft_config.save_path = f"models/faisca_{current_time}_sft.npz"
     sft_config.num_epochs = 1
     sft_config.chart_path = f"charts/faisca_{current_time}_sft.png"
     sft_config.max_train_size = 1000
@@ -1055,6 +1109,7 @@ if __name__ == "__main__":
         train_split=ds_train,
         val_split=ds_val,
         config=sft_config,
+        tokenizer=tokenizer,
     )
 
     (
@@ -1088,14 +1143,6 @@ if __name__ == "__main__":
 
     print("\n========== REINFORCEMENT LEARNING ==========")
 
-    # load model from file
-    # sft_model = FaiscaGPT(
-    #     config=sft_config,
-    # )
-    # sft_model.load_state_dict(
-    #     torch.load("models/faisca_2025-10-04_22-02-58_sft.pt", map_location="cpu")
-    # )
-
     rl_config = {
         "num_rollouts": 24,
         "max_new_tokens": 80,
@@ -1103,7 +1150,6 @@ if __name__ == "__main__":
         "context_length": 128,
         "top_k": 30,
         "eot_token": "<|endoftext|>",
-        "device": "mps",
         "training_steps": 2,
         "train_batch_size": 12,
         "epochs_per_step": 4,
@@ -1114,7 +1160,7 @@ if __name__ == "__main__":
         "chart_path": f"charts/faisca_{current_time}_rl.png",
     }
 
-    rl_model = grpo(
+    rl_model, _, _ = grpo(
         config=rl_config,
         model=sft_model,
         tokenizer=tokenizer,
