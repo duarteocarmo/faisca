@@ -9,9 +9,7 @@ It includes:
 - Supervised fine-tuning (SFT)
 - Reinforcement learning with [GRPO](<https://en.wikipedia.org/wiki/Policy_gradient_method#Group_Relative_Policy_Optimization_(GRPO)>)
 
-I've included a PyTorch version and a MLX version of the code. The MLX version is completely vibed by Codex, so take it with a grain of slop.
-
-Dependencies: `torch`, `tiktoken`, `datasets`, `matplotlib`, and `mlx` (for the MLX version).
+Dependencies: `torch`, `tiktoken`, `datasets`, `matplotlib`
 
 ## Usage
 
@@ -21,12 +19,6 @@ PyTorch version:
 
 ```bash
 $ uv run faisca_torch.py
-```
-
-MLX version:
-
-```bash
-$ uv run faisca_mlx.py
 ```
 
 You can tweak the config/hyperparameters at the bottom of the script.
