@@ -37,7 +37,7 @@ This code is meant to be changed and adapted. But the example uses a [dataset](h
 ## TODO
 
 - [ ] Make MLX version of the script
-- [ ] Make uv-script for main scripts and delete the rest
+- [x] Make uv-script for main scripts and delete the rest
 - [ ] Clean up repo with old scripts, etc
 - [ ] Details to README (description, inspiration)
 - [ ] Add images to README
