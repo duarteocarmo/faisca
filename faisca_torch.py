@@ -9,8 +9,9 @@
 # ]
 # ///
 import os
-import typing as t
 from copy import deepcopy
+import pathlib
+import typing as t
 from dataclasses import dataclass, fields
 from datetime import datetime
 from typing import Optional, Self
@@ -914,7 +915,7 @@ def grpo(
     ax1.plot(steps, step_rewards, "b-", linewidth=2, marker="o", markersize=4)
     ax1.set_xlabel("Training Step")
     ax1.set_ylabel("Total Rewards")
-    ax1.set_title("Sentiment Training: Rewards Over Time")
+    ax1.set_title("Rewards Over Time")
     ax1.grid(True, alpha=0.3)
     ax1.set_ylim(bottom=0)
 
@@ -931,7 +932,7 @@ def grpo(
         )
         ax2.set_xlabel("Training Step")
         ax2.set_ylabel("Average KL Divergence")
-        ax2.set_title("Sentiment Training: KL Divergence Over Time")
+        ax2.set_title("KL Divergence Over Time")
         ax2.grid(True, alpha=0.3)
         ax2.set_ylim(bottom=0)
 
@@ -967,6 +968,13 @@ if __name__ == "__main__":
             "I have not tested this code on CPU/CUDA, so you should probably expect some issues."
         )
         print("You have been warned :)")
+
+    if not pathlib.Path("models").exists():
+        print("Creating models/ directory")
+        pathlib.Path("models").mkdir(parents=True, exist_ok=True)
+    if not pathlib.Path("charts").exists():
+        print("Creating charts/ directory")
+        pathlib.Path("charts").mkdir(parents=True, exist_ok=True)
 
     config = Config(
         batch_size=64,
