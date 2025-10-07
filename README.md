@@ -31,7 +31,7 @@ You can tweak the config/hyperparameters at the bottom of the script.
 
 _Note: I only tested this on my MacBook Pro (~64GB of RAM)_
 
-## Example dataset: Portuguese news headlines
+## Example dataset: Portuguese news headlines 🇵🇹
 
 This code is meant to be changed and adapted. But the example uses a [dataset](https://huggingface.co/datasets/duarteocarmo/ccnews-titles-2016) of headlines in Portuguese (different variants) from CommonCrawl (`ccnews`).
 
