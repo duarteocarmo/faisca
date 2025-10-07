@@ -992,7 +992,7 @@ if __name__ == "__main__":
         max_train_size=1_000,
         train_language="pt",
         url_filter=None,
-        num_epochs=1, 
+        num_epochs=1,
         num_workers=0,
         qkv_bias=False,
         save_path=f"models/faisca_{current_time}.pt",
