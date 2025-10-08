@@ -56,12 +56,11 @@ This code is meant to be changed and adapted. But the example uses a [dataset](h
 
 ## TODO
 
-- [ ] Make MLX version of the script
 - [x] Make uv-script for main scripts and delete the rest
 - [x] Clean up repo with old scripts, etc
 - [x] Details to README (description, inspiration)
 - [x] Add images to README
-- [ ] Write short article
+- [ ] Make MLX version of the script (tried but many memory issues)
 
 ## Places I copied code/ideas from
 
