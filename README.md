@@ -15,10 +15,16 @@ Dependencies: `torch`, `tiktoken`, `datasets`, `matplotlib`
 
 All you need to get this running is [uv](https://docs.astral.sh/uv/getting-started/installation/).
 
-PyTorch version:
+Clone the repo and run:
 
 ```bash
 $ uv run faisca_torch.py
+```
+
+Or, if you don't want to clone the repo, you can run it directly from GitHub:
+
+```bash
+$ uv run https://raw.githubusercontent.com/duarteocarmo/faisca/refs/heads/master/faisca_torch.py
 ```
 
 You can tweak the config/hyperparameters at the bottom of the script.
