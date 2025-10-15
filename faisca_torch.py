@@ -971,6 +971,8 @@ if __name__ == "__main__":
         print(
             "Consider tweaking the dataset size in the config, the model size, or the number of epochs."
         )
+    else:
+        print(f"You have {total_gb_ram:.2f} GB of RAM, which should be enough.")
 
     if not torch.backends.mps.is_available():
         print(
@@ -981,6 +983,9 @@ if __name__ == "__main__":
             "I have not tested this code on CPU/CUDA, so you should probably expect some issues."
         )
         print("You have been warned :)")
+
+    else:
+        print("MPS is available, using it!")
 
     if not pathlib.Path("models").exists():
         print("Creating models/ directory")
