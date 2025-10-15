@@ -5,6 +5,7 @@
 #     "torch",
 #     "matplotlib",
 #     "datasets",
+#     "psutil",
 #     "numpy",
 # ]
 # ///
@@ -16,6 +17,7 @@ from dataclasses import dataclass, fields
 from datetime import datetime
 from typing import Optional, Self
 
+import psutil
 import matplotlib.pyplot as plt
 import random
 import tiktoken
@@ -960,10 +962,21 @@ if __name__ == "__main__":
     current_time = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     torch.manual_seed(42)
 
+    total_gb_ram = psutil.virtual_memory().total / (1024**3)
+
+    if total_gb_ram < 25:
+        print(
+            f"Warning: You have only {total_gb_ram:.2f} GB of RAM. So this might take a while..."
+        )
+        print(
+            "Consider tweaking the dataset size in the config, the model size, or the number of epochs."
+        )
+
     if not torch.backends.mps.is_available():
         print(
             "WARNING: MPS not available, you are probably running on CPU only - which is going to be very slow!"
         )
+        print("(Please tweak the config to use smaller models/datasets if so)")
         print(
             "I have not tested this code on CPU/CUDA, so you should probably expect some issues."
         )
